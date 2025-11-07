@@ -1,0 +1,14 @@
+echo "venv/
+__pycache__/
+.env
+*.log
+*.pyc
+pytest_cache/
+.DS_Store
+*.sqlite
+*.db
+*.json
+__pycache__/
+.env.backup
+config.json
+" > .gitignore
