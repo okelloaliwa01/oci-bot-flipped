@@ -1,7 +1,11 @@
-# src/execution.py
+# ==========================
+# File: src/execution.py  (fully patched with MarketIntegrityGuard + Pending Retry + Limited Attempts)
+# ==========================
 import os
 import math
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
@@ -20,11 +24,10 @@ from config import (
     USE_SMART_EXIT,
 )
 from smart_exit import SmartExitManager
-
+from guards.market_integrity import MarketIntegrityGuard
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
 
 # ============================================================
 # Helper: Safe float conversion
@@ -38,7 +41,6 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
-
 # ============================================================
 # Execution Manager
 # ============================================================
@@ -48,21 +50,38 @@ class ExecutionManager:
     - Opens new positions
     - Delegates ATR-based exit management to SmartExitManager
     - Supports DRY_RUN simulation
+    - Integrates MarketIntegrityGuard for robust entry
+    - Automated retry of pending positions with backoff
     """
 
-    def __init__(self, binance_client, dry_run: bool = False):
+    def __init__(
+        self,
+        binance_client,
+        dry_run: bool = False,
+        retry_interval: float = 10.0,
+        max_retries: int = 5,
+        retry_backoff: float = 2.0
+    ):
         self.client = binance_client
         self.dry_run = dry_run
         self.smart_exit = SmartExitManager(binance_client)
         self.open_positions: Dict[str, Dict[str, Any]] = {}
-
-        logger.info(f"ExecutionManager initialized (dry_run={self.dry_run})")
+        self.guard = MarketIntegrityGuard()
+        self.retry_interval = retry_interval
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self._stop_retry = False
+        self._retry_thread = threading.Thread(target=self._pending_retry_loop, daemon=True)
+        self._retry_thread.start()
+        logger.info(
+            f"ExecutionManager initialized (dry_run={self.dry_run}) "
+            f"retry_interval={self.retry_interval}s, max_retries={self.max_retries}"
+        )
 
     # ------------------------------------------------------------
     # 🔹 Quantity Calculation
     # ------------------------------------------------------------
     def _calc_quantity(self, price: float, margin_usdt: Optional[float] = None) -> float:
-        """Calculate position size based on margin or % balance."""
         try:
             if margin_usdt is None:
                 margin_usdt = (
@@ -87,7 +106,6 @@ class ExecutionManager:
     # ------------------------------------------------------------
     @staticmethod
     def _round_to(value: float, step: float) -> float:
-        """Round a value down to Binance tick/step size."""
         try:
             if step <= 0:
                 return value
@@ -96,28 +114,76 @@ class ExecutionManager:
             return value
 
     # ------------------------------------------------------------
+    # 🔹 Orderbook / trades fetch helpers
+    # ------------------------------------------------------------
+    def _fetch_orderbook(self, symbol: str, limit: int = 50) -> dict:
+        try:
+            for m in ("depth", "get_order_book", "get_depth", "order_book"):
+                if hasattr(self.client, m):
+                    try:
+                        resp = getattr(self.client, m)(symbol=symbol, limit=limit)
+                        if isinstance(resp, dict) and resp.get("bids") and resp.get("asks"):
+                            return {"bids": resp.get("bids"), "asks": resp.get("asks")}
+                    except Exception:
+                        continue
+            import requests
+            url = f"https://fapi.binance.com/fapi/v1/depth"
+            r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=3)
+            r.raise_for_status()
+            j = r.json()
+            return {"bids": j.get("bids", []), "asks": j.get("asks", [])}
+        except Exception as e:
+            logger.debug("_fetch_orderbook error: %s", e)
+            return {"bids": [], "asks": []}
+
+    def _fetch_recent_trades(self, symbol: str, limit: int = 100) -> list:
+        try:
+            for m in ("trades", "recent_trades", "get_recent_trades", "agg_trades"):
+                if hasattr(self.client, m):
+                    try:
+                        resp = getattr(self.client, m)(symbol=symbol, limit=limit)
+                        if isinstance(resp, list):
+                            out = []
+                            for t in resp:
+                                price = safe_float(t.get("price") or t.get("p"), 0.0)
+                                qty = safe_float(t.get("qty") or t.get("q"), 0.0)
+                                side = "sell" if t.get("isBuyerMaker") else "buy" if "isBuyerMaker" in t else str(t.get("side") or t.get("S") or "").lower()
+                                out.append({"price": price, "qty": qty, "side": side})
+                            return out
+                    except Exception:
+                        continue
+            import requests
+            url = f"https://fapi.binance.com/fapi/v1/trades"
+            r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=3)
+            r.raise_for_status()
+            j = r.json()
+            out = []
+            for t in j:
+                price = safe_float(t.get("price"), 0.0)
+                qty = safe_float(t.get("qty"), 0.0)
+                side = "buy" if t.get("isBuyerMaker") is False else "sell"
+                out.append({"price": price, "qty": qty, "side": side})
+            return out
+        except Exception as e:
+            logger.debug("_fetch_recent_trades error: %s", e)
+            return []
+
+    # ------------------------------------------------------------
     # 🔹 Open Position
     # ------------------------------------------------------------
-    def open_position(
-        self,
-        symbol: str,
-        direction: str,
-        margin_usdt: float,
-        tp_percent: float,
-        sl_percent: float,
-    ):
-        """Open a futures position with optional SmartExit integration."""
+    def open_position(self, symbol: str, direction: str, margin_usdt: float, tp_percent: float, sl_percent: float):
+        """Open a futures position with optional SmartExit and MarketIntegrityGuard."""
         try:
             load_dotenv(override=True)
 
-            # 1️⃣ Get current price
+            # 1️⃣ Current price
             price_data = self.client.ticker_price(symbol)
             price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
             if not price or price <= 0:
                 logger.warning(f"⚠️ Invalid price for {symbol}: {price}")
                 return None
 
-            # 2️⃣ Fetch precision filters
+            # 2️⃣ Symbol precision filters
             tick_size = step_size = 0.0
             try:
                 info = self.client.get_symbol_info(symbol)
@@ -129,7 +195,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.warning(f"Failed to fetch symbol filters for {symbol}: {e}")
 
-            # 3️⃣ Estimate ATR (basic fallback)
+            # 3️⃣ ATR fallback
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 15)
@@ -137,16 +203,12 @@ class ExecutionManager:
                     highs = [float(k[2]) for k in klines]
                     lows = [float(k[3]) for k in klines]
                     closes = [float(k[4]) for k in klines]
-                    trs = [
-                        max(h - l, abs(h - closes[i - 1]), abs(l - closes[i - 1]))
-                        for i, (h, l) in enumerate(zip(highs, lows))
-                        if i > 0
-                    ]
+                    trs = [max(h - l, abs(h - closes[i - 1]), abs(l - closes[i - 1])) for i, (h, l) in enumerate(zip(highs, lows)) if i > 0]
                     atr = sum(trs[-14:]) / min(len(trs), 14)
             except Exception as e:
                 logger.debug(f"ATR calculation failed for {symbol}: {e}")
 
-            # 4️⃣ Fallback TP/SL (percentage if ATR unavailable)
+            # 4️⃣ TP/SL calculation
             if atr and atr > 0:
                 if direction.upper() == "LONG":
                     tp_levels = [price + atr * 2.5]
@@ -175,7 +237,7 @@ class ExecutionManager:
             position_type = direction.upper()
             logger.info(f"📈 Preparing {position_type} {symbol} | entry={price:.2f} qty={qty}")
 
-            # 6️⃣ Dry Run
+            # 6️⃣ Dry run
             if self.dry_run:
                 logger.info(f"[DRY RUN] Would open {position_type} {symbol} | entry={price:.2f} qty={qty}")
                 return {
@@ -190,23 +252,51 @@ class ExecutionManager:
                     "dry_run": True,
                 }
 
-            # 7️⃣ Live Market Order
-            try:
-                self.client.futures_create_order(
-                    symbol=symbol,
-                    side="BUY" if position_type == "LONG" else "SELL",
-                    type="MARKET",
-                    quantity=qty,
-                )
-                logger.info(f"✅ Opened {position_type} {symbol} | entry={price:.2f} qty={qty}")
-            except Exception as e:
-                logger.error(f"❌ Failed to open market order for {symbol}: {e}")
-                return None
+            # 7️⃣ Market Integrity Guard
+            orderbook = self._fetch_orderbook(symbol, limit=50)
+            recent_trades = self._fetch_recent_trades(symbol, limit=100)
+            suspect, reason = self.guard.check(orderbook, recent_trades, events_per_sec=0.0)
+            if suspect:
+                # Initialize retry counters
+                pending = self.open_positions.get(symbol, {})
+                retries = pending.get("retry_count", 0)
+                backoff = pending.get("retry_backoff", self.retry_interval)
+                if retries >= self.max_retries:
+                    logger.error(f"❌ Max retries reached for {symbol}, skipping further attempts.")
+                    pending["status"] = "FAILED_MAX_RETRIES"
+                    self.open_positions[symbol] = pending
+                    return pending
 
-            # 8️⃣ Smart Exit Setup
+                logger.warning(f"❗ MarketIntegrityGuard flagged {symbol}: {reason} — PENDING entry (retry {retries+1})")
+                pending.update({
+                    "symbol": symbol,
+                    "side": position_type,
+                    "entry": price,
+                    "qty": qty,
+                    "tp_levels": tp_levels,
+                    "sl": sl,
+                    "atr": atr,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "PENDING_SUSPECT",
+                    "suspect_reason": reason,
+                    "retry_count": retries,
+                    "retry_backoff": backoff
+                })
+                self.open_positions[symbol] = pending
+                return pending
+
+            # 8️⃣ Execute live market order
+            self.client.futures_create_order(
+                symbol=symbol,
+                side="BUY" if position_type == "LONG" else "SELL",
+                type="MARKET",
+                quantity=qty,
+            )
+            logger.info(f"✅ Opened {position_type} {symbol} | entry={price:.2f} qty={qty}")
+
+            # 9️⃣ Smart Exit Setup
             if USE_SMART_EXIT:
                 try:
-                    logger.info(f"🚀 SmartExitManager creating partial TP/SL for {symbol}")
                     self.smart_exit.create_exit_orders(
                         symbol=symbol,
                         side=position_type,
@@ -219,7 +309,7 @@ class ExecutionManager:
                 except Exception as e:
                     logger.error(f"⚠️ SmartExit.create_exit_orders failed for {symbol}: {e}")
 
-            # 9️⃣ Track Position
+            # 10️⃣ Track position
             self.open_positions[symbol] = {
                 "side": position_type,
                 "entry": price,
@@ -229,7 +319,6 @@ class ExecutionManager:
                 "atr": atr,
                 "timestamp": datetime.utcnow().isoformat(),
             }
-
             return self.open_positions[symbol]
 
         except Exception as e:
@@ -237,14 +326,69 @@ class ExecutionManager:
             return None
 
     # ------------------------------------------------------------
-    # 🔹 Manage Active Positions (Smart Exit)
+    # 🔹 Pending Retry Loop (patched smarter)
+    # ------------------------------------------------------------
+    def _pending_retry_loop(self):
+        """
+        Background thread: retry pending positions every self.retry_interval seconds.
+        - Prioritizes recently failing positions (most recent retry first)
+        - Skips positions flagged as permanently invalid (FAILED_MAX_RETRIES)
+        """
+        while not self._stop_retry:
+            time.sleep(self.retry_interval)
+
+            # Collect pending symbols that are retryable
+            pending_symbols = [
+                (s, p) for s, p in self.open_positions.items()
+                if p.get("status") == "PENDING_SUSPECT" and p.get("status") != "FAILED_MAX_RETRIES"
+            ]
+
+            # Sort by last retry timestamp (most recent first)
+            pending_symbols.sort(key=lambda x: x[1].get("last_retry_ts", datetime.min), reverse=True)
+
+            for symbol, pending in pending_symbols:
+                retries = pending.get("retry_count", 0)
+                backoff = pending.get("retry_backoff", self.retry_interval)
+
+                if retries >= self.max_retries:
+                    logger.error(f"❌ Max retries reached for {symbol}, marking as permanently invalid.")
+                    pending["status"] = "FAILED_MAX_RETRIES"
+                    self.open_positions[symbol] = pending
+                    continue
+
+                logger.info(f"🔄 Retrying pending position for {symbol} (attempt {retries+1})")
+                result = self.open_position(
+                    symbol,
+                    pending.get("side", "LONG"),
+                    margin_usdt=pending.get("qty", MARGIN_USDT) * pending.get("entry", 0),
+                    tp_percent=TP_PERCENT,
+                    sl_percent=SL_PERCENT,
+                )
+
+                # Update retry counters and backoff
+                pending["retry_count"] = retries + 1
+                pending["retry_backoff"] = backoff * self.retry_backoff
+                pending["last_retry_ts"] = datetime.utcnow()
+                self.open_positions[symbol] = pending
+
+                # Sleep according to backoff before retrying next
+                time.sleep(pending["retry_backoff"])
+
+
+        # ------------------------------------------------------------
+        # 🔹 Stop Retry Thread
+        # ------------------------------------------------------------
+        def stop_retry_thread(self):
+            self._stop_retry = True
+            if self._retry_thread.is_alive():
+                self._retry_thread.join(timeout=5)
+
+    # ------------------------------------------------------------
+    # 🔹 Manage Active Positions
     # ------------------------------------------------------------
     def manage_positions_live(self):
-        """Run SmartExit trailing/breakeven management for all open positions."""
         if not USE_SMART_EXIT:
-            logger.debug("SmartExit disabled; skipping management.")
             return
-
         for symbol in list(self.open_positions.keys()):
             try:
                 result = self.smart_exit.manage_open_positions(symbol=symbol)
@@ -263,14 +407,11 @@ class ExecutionManager:
     # 🔹 Close Position
     # ------------------------------------------------------------
     def close_position(self, symbol: str, side: str):
-        """Immediately close an active position."""
         if symbol not in self.open_positions:
             logger.warning(f"No open position for {symbol}")
             return
-
         pos = self.open_positions[symbol]
         opposite = "SELL" if side == "BUY" else "BUY"
-
         if DRY_RUN:
             logger.info(f"[DRY RUN] Would close {symbol} ({opposite}) qty={pos['qty']}")
         else:
@@ -284,43 +425,32 @@ class ExecutionManager:
                 logger.info(f"✅ Closed {symbol} position at market.")
             except Exception as e:
                 logger.error(f"❌ Error closing {symbol}: {e}")
-
         self.open_positions.pop(symbol, None)
 
     # ------------------------------------------------------------
     # 🔹 Compatibility Helpers
     # ------------------------------------------------------------
     def reconcile_open_positions(self):
-        logger.debug("♻️ reconcile_open_positions() returning open positions.")
         return self.open_positions
 
     def manage_open_positions(self, symbol: Optional[str] = None):
-        """Detailed wrapper for SmartExitManager.manage_open_positions()."""
         if not USE_SMART_EXIT:
-            logger.debug("SmartExit disabled; skipping manage_open_positions() wrapper.")
             return
-
         targets = [symbol] if symbol else list(self.open_positions.keys())
         for sym in targets:
             try:
                 prev_pos = self.smart_exit._get_open_position(sym) or {}
                 prev_sl = prev_pos.get("sl")
-
                 result = self.smart_exit.manage_open_positions(sym)
-
                 post_pos = self.smart_exit._get_open_position(sym) or {}
                 new_sl = post_pos.get("sl")
-
                 if result and isinstance(result, dict):
                     rtype = result.get("type")
                     if rtype in ("trailing", "breakeven") and new_sl != prev_sl:
-                        logger.info(
-                            f"🔄 [SmartExit] {rtype.upper()} SL change {sym}: {prev_sl or 'None'} → {new_sl}"
-                        )
+                        logger.info(f"🔄 [SmartExit] {rtype.upper()} SL change {sym}: {prev_sl or 'None'} → {new_sl}")
                     elif rtype == "error":
                         logger.warning(f"[SmartExit] {sym} error: {result.get('error')}")
                     elif rtype == "noop":
                         logger.debug(f"[SmartExit] {sym}: No update required.")
-
             except Exception as e:
                 logger.exception(f"⚠️ manage_open_positions() failed for {sym}: {e}")
