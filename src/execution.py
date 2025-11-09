@@ -1,5 +1,5 @@
 # ==========================
-# File: src/execution.py  (fully patched with MarketIntegrityGuard + Pending Retry + Limited Attempts)
+# File: src/execution.py  (fully patched, production-stable)
 # ==========================
 import os
 import math
@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
+import statistics
 
 from config import (
     SYMBOL,
@@ -41,6 +42,7 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+
 # ============================================================
 # Execution Manager
 # ============================================================
@@ -60,7 +62,7 @@ class ExecutionManager:
         dry_run: bool = False,
         retry_interval: float = 10.0,
         max_retries: int = 5,
-        retry_backoff: float = 2.0
+        retry_backoff: float = 2.0,
     ):
         self.client = binance_client
         self.dry_run = dry_run
@@ -71,7 +73,9 @@ class ExecutionManager:
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self._stop_retry = False
-        self._retry_thread = threading.Thread(target=self._pending_retry_loop, daemon=True)
+        self._retry_thread = threading.Thread(
+            target=self._pending_retry_loop, daemon=True
+        )
         self._retry_thread.start()
         logger.info(
             f"ExecutionManager initialized (dry_run={self.dry_run}) "
@@ -127,7 +131,8 @@ class ExecutionManager:
                     except Exception:
                         continue
             import requests
-            url = f"https://fapi.binance.com/fapi/v1/depth"
+
+            url = "https://fapi.binance.com/fapi/v1/depth"
             r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=3)
             r.raise_for_status()
             j = r.json()
@@ -147,13 +152,20 @@ class ExecutionManager:
                             for t in resp:
                                 price = safe_float(t.get("price") or t.get("p"), 0.0)
                                 qty = safe_float(t.get("qty") or t.get("q"), 0.0)
-                                side = "sell" if t.get("isBuyerMaker") else "buy" if "isBuyerMaker" in t else str(t.get("side") or t.get("S") or "").lower()
+                                side = (
+                                    "sell"
+                                    if t.get("isBuyerMaker")
+                                    else "buy"
+                                    if "isBuyerMaker" in t
+                                    else str(t.get("side") or t.get("S") or "").lower()
+                                )
                                 out.append({"price": price, "qty": qty, "side": side})
                             return out
                     except Exception:
                         continue
             import requests
-            url = f"https://fapi.binance.com/fapi/v1/trades"
+
+            url = "https://fapi.binance.com/fapi/v1/trades"
             r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=3)
             r.raise_for_status()
             j = r.json()
@@ -195,7 +207,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.warning(f"Failed to fetch symbol filters for {symbol}: {e}")
 
-            # 3️⃣ ATR fallback
+            # 3️⃣ ATR fallback (smoothed)
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 15)
@@ -203,8 +215,12 @@ class ExecutionManager:
                     highs = [float(k[2]) for k in klines]
                     lows = [float(k[3]) for k in klines]
                     closes = [float(k[4]) for k in klines]
-                    trs = [max(h - l, abs(h - closes[i - 1]), abs(l - closes[i - 1])) for i, (h, l) in enumerate(zip(highs, lows)) if i > 0]
-                    atr = sum(trs[-14:]) / min(len(trs), 14)
+                    trs = [
+                        max(h - l, abs(h - closes[i - 1]), abs(l - closes[i - 1]))
+                        for i, (h, l) in enumerate(zip(highs, lows))
+                        if i > 0
+                    ]
+                    atr = statistics.fmean(trs[-14:])
             except Exception as e:
                 logger.debug(f"ATR calculation failed for {symbol}: {e}")
 
@@ -257,7 +273,6 @@ class ExecutionManager:
             recent_trades = self._fetch_recent_trades(symbol, limit=100)
             suspect, reason = self.guard.check(orderbook, recent_trades, events_per_sec=0.0)
             if suspect:
-                # Initialize retry counters
                 pending = self.open_positions.get(symbol, {})
                 retries = pending.get("retry_count", 0)
                 backoff = pending.get("retry_backoff", self.retry_interval)
@@ -326,24 +341,16 @@ class ExecutionManager:
             return None
 
     # ------------------------------------------------------------
-    # 🔹 Pending Retry Loop (patched smarter)
+    # 🔹 Pending Retry Loop
     # ------------------------------------------------------------
     def _pending_retry_loop(self):
-        """
-        Background thread: retry pending positions every self.retry_interval seconds.
-        - Prioritizes recently failing positions (most recent retry first)
-        - Skips positions flagged as permanently invalid (FAILED_MAX_RETRIES)
-        """
         while not self._stop_retry:
             time.sleep(self.retry_interval)
 
-            # Collect pending symbols that are retryable
             pending_symbols = [
                 (s, p) for s, p in self.open_positions.items()
-                if p.get("status") == "PENDING_SUSPECT" and p.get("status") != "FAILED_MAX_RETRIES"
+                if p.get("status") == "PENDING_SUSPECT"
             ]
-
-            # Sort by last retry timestamp (most recent first)
             pending_symbols.sort(key=lambda x: x[1].get("last_retry_ts", datetime.min), reverse=True)
 
             for symbol, pending in pending_symbols:
@@ -356,32 +363,37 @@ class ExecutionManager:
                     self.open_positions[symbol] = pending
                     continue
 
+                margin_usdt = (pending.get("qty") or 0) * (pending.get("entry") or 0)
+                if margin_usdt <= 0:
+                    margin_usdt = MARGIN_USDT
+
                 logger.info(f"🔄 Retrying pending position for {symbol} (attempt {retries+1})")
-                result = self.open_position(
+                self.open_position(
                     symbol,
                     pending.get("side", "LONG"),
-                    margin_usdt=pending.get("qty", MARGIN_USDT) * pending.get("entry", 0),
+                    margin_usdt=margin_usdt,
                     tp_percent=TP_PERCENT,
                     sl_percent=SL_PERCENT,
                 )
 
-                # Update retry counters and backoff
                 pending["retry_count"] = retries + 1
                 pending["retry_backoff"] = backoff * self.retry_backoff
                 pending["last_retry_ts"] = datetime.utcnow()
                 self.open_positions[symbol] = pending
 
-                # Sleep according to backoff before retrying next
                 time.sleep(pending["retry_backoff"])
 
+    # ------------------------------------------------------------
+    # 🔹 Stop Retry Thread
+    # ------------------------------------------------------------
+    def stop_retry_thread(self):
+        """Gracefully stop the background retry thread."""
+        self._stop_retry = True
+        if self._retry_thread.is_alive():
+            self._retry_thread.join(timeout=5)
 
-        # ------------------------------------------------------------
-        # 🔹 Stop Retry Thread
-        # ------------------------------------------------------------
-        def stop_retry_thread(self):
-            self._stop_retry = True
-            if self._retry_thread.is_alive():
-                self._retry_thread.join(timeout=5)
+    def __del__(self):
+        self.stop_retry_thread()
 
     # ------------------------------------------------------------
     # 🔹 Manage Active Positions
