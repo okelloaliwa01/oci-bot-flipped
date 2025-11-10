@@ -264,43 +264,48 @@ class ExecutionManager:
         sl_percent: float,
     ) -> Optional[Dict[str, Any]]:
         """
-        Robust position opener with:
-        - ATR-based TP/SL fallback
-        - MarketIntegrityGuard protection
-        - SmartExit integration
-        - Retry, hedge detection & filter validation
-        - Binance REST timestamp and error patching
+        Hybrid patched position opener:
+        - Uses Binance SDK futures_create_order (avoids _rest_signed_post issues)
+        - Fixes -1102 timestamp error by syncing server time
+        - Supports ATR fallback TP/SL, SmartExit, dry-run, logging
+        - Includes MarketIntegrityGuard and quantity validation
         """
         import os
-        import math
-        import json
-        import logging
-        import time
         import statistics
+        import logging
         from datetime import datetime
+        from dotenv import load_dotenv
 
         logger = logging.getLogger(__name__)
 
         try:
-            # --- Load dotenv if available ---
+            # --- Load environment ---
             try:
-                from dotenv import load_dotenv
                 load_dotenv(override=True)
             except Exception:
                 pass
 
-            # --- 1️⃣ ATR multipliers ---
+            # --- 1️⃣ Sync server time to avoid -1102 ---
+            try:
+                server_time = self.client.futures_time()
+                if isinstance(server_time, dict) and "serverTime" in server_time:
+                    offset = server_time["serverTime"] - int(time.time() * 1000)
+                    self.client.time_offset = offset
+            except Exception as e:
+                logger.debug("Server time sync failed: %s", e)
+
+            # --- 2️⃣ ATR multipliers ---
             tp_mults = [float(x) for x in os.getenv("ATR_MULT_TP", "2.0,3.0,4.0").split(",") if x.strip()]
             sl_mult = float(os.getenv("ATR_MULT_SL", "1.5"))
 
-            # --- 2️⃣ current price ---
+            # --- 3️⃣ Current price ---
             price_data = self.client.ticker_price(symbol)
-            price = float(price_data.get("price", 0)) if isinstance(price_data, dict) else float(price_data)
-            if price <= 0:
-                logger.warning("⚠️ Invalid price for %s: %s", symbol, price)
+            price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
+            if not price or price <= 0:
+                logger.warning(f"⚠️ Invalid price for {symbol}: {price}")
                 return None
 
-            # --- 3️⃣ symbol filters ---
+            # --- 4️⃣ Symbol filters ---
             tick, step, min_qty, min_notional = 0.0, 0.0, None, None
             try:
                 info = self.client.get_symbol_info(symbol) or {}
@@ -317,7 +322,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Filter fetch failed for %s: %s", symbol, e)
 
-            # --- 4️⃣ ATR fallback ---
+            # --- 5️⃣ ATR fallback ---
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 30) or []
@@ -333,7 +338,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("ATR fetch failed: %s", e)
 
-            # --- 5️⃣ compute TP & SL ---
+            # --- 6️⃣ Compute TP & SL ---
             is_long = direction.upper() in ("LONG", "BUY")
             if atr and atr > 0:
                 tp_levels = [price + atr * m if is_long else price - atr * m for m in tp_mults]
@@ -344,24 +349,26 @@ class ExecutionManager:
             tp_levels = [self._round_to(tp, tick) for tp in tp_levels]
             sl = self._round_to(sl, tick)
 
-            # --- 6️⃣ quantity ---
+            # --- 7️⃣ Quantity ---
             qty = self._round_to(self._calc_quantity(price, margin_usdt), step)
             if qty <= 0:
                 logger.warning("Invalid qty computed for %s", symbol)
                 return None
 
-            # --- 7️⃣ dry-run ---
+            # --- 8️⃣ Dry-run ---
             if self.dry_run:
                 pos = {
-                    "symbol": symbol, "side": direction, "entry": price, "qty": qty,
+                    "symbol": symbol, "side": direction,
+                    "entry": price, "qty": qty,
                     "tp_levels": tp_levels, "sl": sl, "atr": atr,
-                    "timestamp": datetime.utcnow().isoformat(), "status": "DRY_RUN"
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "DRY_RUN"
                 }
                 self.open_positions[symbol] = pos
                 logger.info("🧪 DRY-RUN: %s %s", direction, symbol)
                 return pos
 
-            # --- 8️⃣ integrity check ---
+            # --- 9️⃣ MarketIntegrityGuard ---
             orderbook = self._fetch_orderbook(symbol)
             trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, trades, events_per_sec=0.0)
@@ -381,23 +388,14 @@ class ExecutionManager:
                 self.open_positions[symbol] = pending
                 return pending
 
-            # --- 9️⃣ leverage & hedge detection ---
+            # --- 🔟 Leverage & hedge detection ---
             try:
                 if hasattr(self.client, "futures_change_leverage"):
                     self.client.futures_change_leverage(symbol=symbol, leverage=int(os.getenv("LEVERAGE", "10")))
             except Exception as le:
                 logger.debug("Leverage set failed: %s", le)
 
-            pos_side = None
-            try:
-                acc_fn = getattr(self.client, "futures_account", None) or getattr(self.client, "get_futures_account", None)
-                acc = acc_fn() if callable(acc_fn) else {}
-                if isinstance(acc, dict) and acc.get("dualSidePosition"):
-                    pos_side = "LONG" if is_long else "SHORT"
-            except Exception:
-                pos_side = None
-
-            # --- 🔟 validation ---
+            # --- 1️⃣1️⃣ Validation ---
             if min_qty is not None and qty < float(min_qty):
                 failure = {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"qty<{min_qty}"}
                 self.open_positions[symbol] = failure
@@ -409,43 +407,17 @@ class ExecutionManager:
                 logger.error("Notional validation failed for %s: notional=%.8f minNotional=%s", symbol, qty * price, min_notional)
                 return failure
 
-            # --- 1️⃣1️⃣ place market order via patched _rest_signed_post ---
-            order = None
-            order_id = None
+            # --- 1️⃣2️⃣ Place Market Order (SDK call, safe) ---
             try:
-                order_kwargs = {
-                    "symbol": symbol,
-                    "side": "BUY" if is_long else "SELL",
-                    "type": "MARKET",
-                    "quantity": qty,
-                }
-                if pos_side:
-                    order_kwargs["positionSide"] = pos_side
-
-                logger.debug("Placing order: %s %s qty=%.8f kwargs=%s", direction, symbol, qty, order_kwargs)
-                order = self._rest_signed_post("/fapi/v1/order", payload=order_kwargs)
-                order_id = order.get("orderId") or order.get("order_id") or order.get("id") or order.get("clientOrderId")
-                logger.info("✅ %s %s opened @%.2f qty=%.8f order_id=%s", direction, symbol, price, qty, order_id or "?")
+                order_result = self.client.futures_create_order(
+                    symbol=symbol,
+                    side="BUY" if is_long else "SELL",
+                    type="MARKET",
+                    quantity=qty,
+                )
+                logger.info("✅ Opened %s %s @%.2f qty=%.8f", direction, symbol, price, qty)
             except Exception as e:
-                # Robust error parsing
-                err_text = str(e)
-                try:
-                    resp = getattr(e, "response", None)
-                    text = getattr(resp, "text", None) or getattr(resp, "content", None)
-                    if isinstance(text, (bytes, bytearray)):
-                        text = text.decode("utf-8", errors="ignore")
-                    if text:
-                        try:
-                            parsed = json.loads(text)
-                            code = parsed.get("code")
-                            msg = parsed.get("msg") or parsed.get("message") or parsed.get("msg")
-                            err_text = f"{code}: {msg}" if code is not None else str(parsed)
-                        except Exception:
-                            err_text = text
-                except Exception:
-                    pass
-
-                logger.exception("❌ Market order failed for %s: %s", symbol, err_text)
+                logger.exception("❌ Market order failed for %s: %s", symbol, e)
                 pending = {
                     "symbol": symbol,
                     "side": direction,
@@ -456,18 +428,15 @@ class ExecutionManager:
                     "atr": atr,
                     "timestamp": datetime.utcnow().isoformat(),
                     "status": "PENDING_ORDER_FAILED",
-                    "error": err_text,
-                    "error_detail": repr(e),
-                    "retry_count": 0,
-                    "retry_backoff": self.retry_interval,
+                    "error": str(e),
                 }
                 self.open_positions[symbol] = pending
                 return pending
 
-            # --- 1️⃣2️⃣ SmartExit integration ---
+            # --- 1️⃣3️⃣ SmartExit integration ---
             smartexit_err = None
-            try:
-                if USE_SMART_EXIT:
+            if USE_SMART_EXIT:
+                try:
                     self.smart_exit.create_exit_orders(
                         symbol=symbol,
                         side=direction,
@@ -478,11 +447,11 @@ class ExecutionManager:
                         step_size=step,
                         tp_levels=tp_levels,
                     )
-            except Exception as e:
-                smartexit_err = str(e)
-                logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
+                except Exception as e:
+                    smartexit_err = str(e)
+                    logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
 
-            # --- 1️⃣3️⃣ track opened position ---
+            # --- 1️⃣4️⃣ Track opened position ---
             tracked = {
                 "symbol": symbol,
                 "side": direction,
@@ -493,8 +462,7 @@ class ExecutionManager:
                 "atr": atr,
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": "OPEN",
-                "order_result": order,
-                "order_id": order_id,
+                "order_result": order_result,
                 "smartexit_error": smartexit_err,
             }
             self.open_positions[symbol] = tracked
@@ -511,9 +479,6 @@ class ExecutionManager:
             }
             self.open_positions[symbol] = failure
             return failure
-
-
-
 
     # ---------------------------
     # Pending retry loop
