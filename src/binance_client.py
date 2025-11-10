@@ -56,8 +56,15 @@ except ImportError:
             logging.warning("⚠️ No Binance SDK found. Will use REST fallback only.")
 
 
-logger = logging.getLogger("binance_client")
-logger.setLevel(logging.INFO)
+#logger = logging.getLogger("binance_client")
+logger = logging.getLogger(__name__)
+#logger.setLevel(logging.INFO)
+try:
+    from binance.error import ClientError as BinanceAPIException
+except Exception:
+    BinanceAPIException = Exception  # fallback for SDK variants
+
+
 
 
 # ======================================================================
@@ -705,15 +712,20 @@ class BinanceClient:
         for m in possible_methods:
             if hasattr(self._client, m):
                 try:
-                    method = getattr(self._client, m)
-                    return method(**kwargs)
+                    logger.debug("[place_order] trying variant: %s", m)
+                    return getattr(self._client, m)(**kwargs)
                 except Exception as e:
                     logger.debug("[place_order] variant %s failed: %s", m, e)
                     continue
 
         # --- REST fallback ---
         try:
-            return self._rest_signed_post("/fapi/v1/order", kwargs)
+            logger.debug("[place_order] using REST fallback")
+            if hasattr(self.client, "_request_futures_api"):
+                return self._request_futures_api('POST', 'order', True, data=kwargs)
+            else:
+                return self._rest_signed_post("/fapi/v1/order", kwargs)
+
         except Exception as e:
             logger.error("[place_order] REST fallback failed: %s", e)
             raise
@@ -818,9 +830,9 @@ class BinanceClient:
         Falls back to create_order() or new_order() automatically.
         """
         self._init()
-        # Dry-run simulation
+
+        # --- Dry-run simulation ---
         if os.getenv("DRY_RUN", "False").lower() == "true":
-            import datetime
             logger.info("[DRY_RUN] Simulated futures_create_order: %s", kwargs)
             return {
                 "symbol": kwargs.get("symbol"),
@@ -832,25 +844,56 @@ class BinanceClient:
                 "timestamp": datetime.datetime.utcnow().isoformat(),
             }
 
-        # Try direct call first
+        # --- Try native SDK futures order ---
         if hasattr(self._client, "futures_create_order"):
-            return self._client.futures_create_order(**kwargs)
+            try:
+                logger.debug("[futures_create_order] using native SDK futures_create_order()")
+                return self._client.futures_create_order(**kwargs)
+            except BinanceAPIException as e:
+                logger.error("[futures_create_order] BinanceAPIException: %s", e)
+            except Exception as e:
+                logger.debug("[futures_create_order] SDK futures_create_order failed: %s", e)
 
-        # Fallback to universal order creators
+        # --- Fallback: create_order() / new_order() ---
         for m in ("create_order", "new_order"):
             if hasattr(self._client, m):
                 try:
+                    logger.debug("[futures_create_order] fallback variant: %s", m)
                     return getattr(self._client, m)(**kwargs)
                 except Exception as e:
                     logger.debug("[futures_create_order] fallback %s failed: %s", m, e)
 
-        # Last resort — REST fallback
+        # --- Final REST fallback ---
         try:
-            return self._rest_signed_post("/fapi/v1/order", kwargs)
+            logger.debug("[futures_create_order] using REST fallback")
+            if hasattr(self.client, "_request_futures_api"):
+                return self._request_futures_api('POST', 'order', True, data=kwargs)
+            else:
+                return self._rest_signed_post("/fapi/v1/order", kwargs)
+
         except Exception as e:
             logger.error("[futures_create_order] REST fallback failed: %s", e)
             raise
+    
 
+    # ============================================================
+    # 🧪 SELF-TEST SNIPPET
+    # ============================================================
+    def test_order_flow(self):
+        """
+        Simple local test to confirm SDK vs REST behavior.
+        """
+        logger.info("[TEST] Starting BinanceClient order path test...")
+        try:
+            result = self.futures_create_order(
+                symbol="BTCUSDT",
+                side="BUY",
+                type="MARKET",
+                quantity=0.001
+            )
+            logger.info("[TEST] Order path succeeded: %s", result)
+        except Exception as e:
+            logger.error("[TEST] Order path failed: %s", e)
 
     # REST POST helper (signed)
     def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
