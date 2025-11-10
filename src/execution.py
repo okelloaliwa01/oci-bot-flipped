@@ -244,7 +244,7 @@ class ExecutionManager:
             except Exception:
                 logger.debug("ATR fallback failed for %s", symbol)
 
-            # --- Compute TP & SL (consistent with SmartExit)
+            # --- Compute TP & SL (use ATR multipliers if available)
             tp_levels = []
             sl = None
             if atr and atr > 0:
@@ -255,7 +255,7 @@ class ExecutionManager:
                     tp_levels = [price - atr * m for m in tp_multipliers]
                     sl = price + atr * sl_multiplier
             else:
-                # fallback: percent-based
+                # fallback: percent-based (single TP)
                 if direction.upper() in ("LONG", "BUY"):
                     tp_levels = [price * (1 + tp_percent / 100.0)]
                     sl = price * (1 - sl_percent / 100.0)
@@ -263,7 +263,7 @@ class ExecutionManager:
                     tp_levels = [price * (1 - tp_percent / 100.0)]
                     sl = price * (1 + sl_percent / 100.0)
 
-            # Apply rounding to symbol precision
+            # Apply rounding to symbol precision (do rounding once here)
             tp_levels = [self._round_to(tp, tick_size) for tp in tp_levels]
             sl = self._round_to(sl, tick_size)
 
@@ -296,37 +296,100 @@ class ExecutionManager:
                 self.open_positions[symbol] = tracked
                 return tracked
 
-            # --- MarketIntegrityGuard pre-check
+            # --- MarketIntegrityGuard pre-check (interprets tier suffix)
             orderbook = self._fetch_orderbook(symbol)
             recent_trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, recent_trades, events_per_sec=0.0)
+
+            # reason may be like "depth_imbalance_ask_-0.943|RETRY" or "...|BLOCK" or "...|LOG"
+            action = None
+            if isinstance(reason, str) and "|" in reason:
+                parts = reason.split("|")
+                if len(parts) >= 2:
+                    action = parts[-1].upper()
+                    reason_base = "|".join(parts[:-1])
+                else:
+                    reason_base = reason
+            else:
+                reason_base = reason
+
             if suspect:
-                pending = self.open_positions.get(symbol, {})
-                retries = pending.get("retry_count", 0)
-                backoff = pending.get("retry_backoff", self.retry_interval * (atr or 1.0))
-                if retries >= self.max_retries:
-                    pending["status"] = "FAILED_MAX_RETRIES"
+                # Decide based on action suffix
+                if action == "BLOCK":
+                    # permanent block - mark as failed and do not retry
+                    pending = {
+                        "symbol": symbol,
+                        "side": position_type,
+                        "entry": price,
+                        "qty": qty,
+                        "tp_levels": tp_levels,
+                        "sl": sl,
+                        "atr": atr,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "FAILED_BLOCK",
+                        "suspect_reason": reason_base or reason,
+                    }
                     self.open_positions[symbol] = pending
-                    logger.error("Max retries reached for %s; marking FAILED_MAX_RETRIES", symbol)
+                    logger.error("🚫 MarketIntegrityGuard BLOCK for %s: %s", symbol, reason)
                     return pending
 
-                pending.update({
-                    "symbol": symbol,
-                    "side": position_type,
-                    "entry": price,
-                    "qty": qty,
-                    "tp_levels": tp_levels,
-                    "sl": sl,
-                    "atr": atr,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "status": "PENDING_SUSPECT",
-                    "suspect_reason": reason,
-                    "retry_count": retries,
-                    "retry_backoff": backoff,
-                })
-                self.open_positions[symbol] = pending
-                logger.warning("❗ MarketIntegrityGuard flagged %s — pending entry (retry %s)", symbol, retries + 1)
-                return pending
+                elif action == "RETRY" or action is None:
+                    # retryable: create/extend pending entry and schedule retry/backoff
+                    pending = self.open_positions.get(symbol, {})
+                    retries = pending.get("retry_count", 0)
+                    # scale initial backoff by ATR magnitude to avoid rapid retries in noisy markets
+                    initial_backoff = self.retry_interval * (abs(atr) if atr and atr > 0 else 1.0)
+                    backoff = pending.get("retry_backoff", initial_backoff)
+
+                    if retries >= self.max_retries:
+                        pending["status"] = "FAILED_MAX_RETRIES"
+                        self.open_positions[symbol] = pending
+                        logger.error("Max retries reached for %s; marking FAILED_MAX_RETRIES", symbol)
+                        return pending
+
+                    pending.update({
+                        "symbol": symbol,
+                        "side": position_type,
+                        "entry": price,
+                        "qty": qty,
+                        "tp_levels": tp_levels,
+                        "sl": sl,
+                        "atr": atr,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "PENDING_SUSPECT",
+                        "suspect_reason": reason_base or reason,
+                        "retry_count": retries,
+                        "retry_backoff": backoff,
+                    })
+                    self.open_positions[symbol] = pending
+                    logger.warning("⚠️ MarketIntegrityGuard flagged %s: %s — PENDING entry (retry %s)", symbol, reason, retries + 1)
+                    return pending
+
+                elif action == "LOG":
+                    # informational only: proceed
+                    logger.info("ℹ️ MarketIntegrityGuard INFO for %s: %s — proceeding with execution", symbol, reason)
+                else:
+                    # default: conservative retry
+                    pending = self.open_positions.get(symbol, {})
+                    retries = pending.get("retry_count", 0)
+                    backoff = pending.get("retry_backoff", self.retry_interval)
+                    pending.update({
+                        "symbol": symbol,
+                        "side": position_type,
+                        "entry": price,
+                        "qty": qty,
+                        "tp_levels": tp_levels,
+                        "sl": sl,
+                        "atr": atr,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "PENDING_SUSPECT",
+                        "suspect_reason": reason,
+                        "retry_count": retries,
+                        "retry_backoff": backoff,
+                    })
+                    self.open_positions[symbol] = pending
+                    logger.warning("⚠️ MarketIntegrityGuard flagged (unknown action) for %s: %s — PENDING", symbol, reason)
+                    return pending
 
             # --- Execute entry order
             try:
@@ -341,7 +404,7 @@ class ExecutionManager:
                 logger.error("Market order failed for %s: %s", symbol, e)
                 return None
 
-            # --- SmartExit: multi-TP
+            # --- SmartExit: multi-TP (pass tp_levels explicitly)
             if USE_SMART_EXIT:
                 try:
                     self.smart_exit.create_exit_orders(
@@ -352,7 +415,7 @@ class ExecutionManager:
                         atr_value=atr,
                         tick_size=tick_size,
                         step_size=step_size,
-                        tp_levels=tp_levels,  # ✅ Consistent with SmartExit
+                        tp_levels=tp_levels,
                     )
                 except Exception as e:
                     logger.error("SmartExit.create_exit_orders failed for %s: %s", symbol, e)
@@ -374,7 +437,6 @@ class ExecutionManager:
         except Exception as e:
             logger.exception("Unhandled error in open_position(%s): %s", symbol, e)
             return None
-
 
     # ---------------------------
     # Pending retry loop
@@ -401,10 +463,13 @@ class ExecutionManager:
                         margin_usdt = MARGIN_USDT
 
                     logger.info("🔄 Retrying %s (attempt %s)", symbol, retries + 1)
+                    # call open_position again which will re-check guard & either place order or update pending entry
                     self.open_position(symbol, p.get("side", "LONG"), margin_usdt, TP_PERCENT, SL_PERCENT)
 
-                    p["retry_count"] = retries + 1
-                    p["retry_backoff"] = backoff * self.retry_backoff
+                    # update retry counters/backoff
+                    p = self.open_positions.get(symbol, p)  # refresh in case open_position updated it
+                    p["retry_count"] = p.get("retry_count", retries) + 1
+                    p["retry_backoff"] = p.get("retry_backoff", backoff) * self.retry_backoff
                     p["last_retry_ts"] = datetime.utcnow()
                     self.open_positions[symbol] = p
                     time.sleep(p["retry_backoff"])
