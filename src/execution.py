@@ -79,6 +79,10 @@ class ExecutionManager:
             self.retry_interval,
             self.max_retries,
         )
+    # Inside ExecutionManager
+    def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
+        """Proxy to client's _rest_signed_post"""
+        return self.client._rest_signed_post(endpoint, payload=payload, timeout=timeout)
 
     # ---------------------------
     # Quantity calculation
@@ -251,7 +255,14 @@ class ExecutionManager:
     # ---------------------------
     # Open position (multi-TP + ATR retry)
     # ---------------------------
-    def open_position(self, symbol: str, direction: str, margin_usdt: float, tp_percent: float, sl_percent: float) -> Optional[Dict[str, Any]]:
+    def open_position(
+        self,
+        symbol: str,
+        direction: str,
+        margin_usdt: float,
+        tp_percent: float,
+        sl_percent: float,
+    ) -> Optional[Dict[str, Any]]:
         """
         Robust position opener with:
         - ATR-based TP/SL fallback
@@ -271,7 +282,7 @@ class ExecutionManager:
         logger = logging.getLogger(__name__)
 
         try:
-            # --- load dotenv if available ---
+            # --- Load dotenv if available ---
             try:
                 from dotenv import load_dotenv
                 load_dotenv(override=True)
@@ -398,66 +409,41 @@ class ExecutionManager:
                 logger.error("Notional validation failed for %s: notional=%.8f minNotional=%s", symbol, qty * price, min_notional)
                 return failure
 
-            # --- 1️⃣1️⃣ place market order (include timestamp) ---
-            ts = int(time.time() * 1000)
-            order_kwargs = {
-                "symbol": symbol,
-                "side": "BUY" if is_long else "SELL",
-                "type": "MARKET",
-                "quantity": qty,
-                "timestamp": ts,
-                # "recvWindow": 5000,  # optional
-            }
-            if pos_side:
-                order_kwargs["positionSide"] = pos_side
-
+            # --- 1️⃣1️⃣ place market order via patched _rest_signed_post ---
             order = None
+            order_id = None
             try:
-                logger.debug("Placing order: %s %s qty=%.8f kwargs=%s", direction, symbol, qty, {k: v for k, v in order_kwargs.items() if k != "quantity"})
-                order = self.client.futures_create_order(**order_kwargs)
-                order_id = None
-                if isinstance(order, dict):
-                    order_id = order.get("orderId") or order.get("order_id") or order.get("id") or order.get("clientOrderId")
+                order_kwargs = {
+                    "symbol": symbol,
+                    "side": "BUY" if is_long else "SELL",
+                    "type": "MARKET",
+                    "quantity": qty,
+                }
+                if pos_side:
+                    order_kwargs["positionSide"] = pos_side
+
+                logger.debug("Placing order: %s %s qty=%.8f kwargs=%s", direction, symbol, qty, order_kwargs)
+                order = self._rest_signed_post("/fapi/v1/order", payload=order_kwargs)
+                order_id = order.get("orderId") or order.get("order_id") or order.get("id") or order.get("clientOrderId")
                 logger.info("✅ %s %s opened @%.2f qty=%.8f order_id=%s", direction, symbol, price, qty, order_id or "?")
             except Exception as e:
-                # SAFE, PYLANCE-friendly extraction of response/text
+                # Robust error parsing
                 err_text = str(e)
                 try:
-                    resp = getattr(e, "response", None)  # safe: getattr avoids attribute access errors
-                    text = None
-                    if resp is not None:
-                        text = getattr(resp, "text", None) or getattr(resp, "content", None)
-                    # try JSON from resp.text/content
+                    resp = getattr(e, "response", None)
+                    text = getattr(resp, "text", None) or getattr(resp, "content", None)
                     if isinstance(text, (bytes, bytearray)):
-                        try:
-                            text = text.decode("utf-8", errors="ignore")
-                        except Exception:
-                            text = None
+                        text = text.decode("utf-8", errors="ignore")
                     if text:
                         try:
                             parsed = json.loads(text)
-                            # Binance typical structure: {"code":-1102,"msg":"..."}
                             code = parsed.get("code")
                             msg = parsed.get("msg") or parsed.get("message") or parsed.get("msg")
                             err_text = f"{code}: {msg}" if code is not None else str(parsed)
                         except Exception:
-                            # fallback to raw text
                             err_text = text
-                    else:
-                        # sometimes the HTTPError message contains useful info in args
-                        if hasattr(e, "args") and len(e.args) > 0:
-                            maybe = e.args[0]
-                            if isinstance(maybe, str):
-                                # try JSON parse as last resort
-                                try:
-                                    parsed = json.loads(maybe)
-                                    err_text = f"{parsed.get('code')}: {parsed.get('msg')}"
-                                except Exception:
-                                    err_text = maybe
-                            else:
-                                err_text = str(maybe)
                 except Exception:
-                    err_text = str(e)
+                    pass
 
                 logger.exception("❌ Market order failed for %s: %s", symbol, err_text)
                 pending = {
@@ -496,7 +482,7 @@ class ExecutionManager:
                 smartexit_err = str(e)
                 logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
 
-            # --- 1️⃣3️⃣ Track opened position ---
+            # --- 1️⃣3️⃣ track opened position ---
             tracked = {
                 "symbol": symbol,
                 "side": direction,
@@ -508,7 +494,7 @@ class ExecutionManager:
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": "OPEN",
                 "order_result": order,
-                "order_id": order_id if 'order_id' in locals() else None,
+                "order_id": order_id,
                 "smartexit_error": smartexit_err,
             }
             self.open_positions[symbol] = tracked
@@ -525,6 +511,7 @@ class ExecutionManager:
             }
             self.open_positions[symbol] = failure
             return failure
+
 
 
 

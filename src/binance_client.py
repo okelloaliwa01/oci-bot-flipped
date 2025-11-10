@@ -193,25 +193,37 @@ class BinanceClient:
         params.update({"timestamp": int(ts), "recvWindow": 60000})
         return params
 
-    def _rest_signed_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, timeout: int = 5) -> requests.Response:
-        """Perform a signed GET to Binance REST endpoint using stored api_secret."""
+    def _rest_signed_get(
+        self, endpoint: str, params: Optional[Dict[str, Any]] = None, timeout: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Robust signed GET request to Binance:
+        - uses _signed_params() to handle timestamp + recvWindow
+        - signs with HMAC-SHA256
+        - raises for HTTP errors
+        """
+        import requests, hmac, hashlib
+        from urllib.parse import urlencode
+
         if params is None:
             params = {}
+
         signed = self._signed_params(params.copy())
         query_string = urlencode(signed)
-        signature = hmac.new(self.api_secret.encode("utf-8"),
-                             query_string.encode("utf-8"),
-                             hashlib.sha256).hexdigest()
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
         signed["signature"] = signature
 
         url = f"{self._base_url}{endpoint}"
-        headers = {"X-MBX-APIKEY": self.api_key, "Content-Type": "application/json"}
+        headers = {"X-MBX-APIKEY": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
+        sess = self._session or requests
 
-        if not self._session:
-            self._session = requests.Session()
-
-        resp = self._session.get(url, headers=headers, params=signed, timeout=timeout)
-        return resp
+        resp = sess.get(url, headers=headers, params=signed, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
     # ==================================================================
     # Market & Symbol Info
@@ -829,19 +841,35 @@ class BinanceClient:
 
 
     # REST POST helper (signed)
-    def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
+    def _rest_signed_post(
+        self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Robust signed POST request to Binance:
+        - uses _signed_params() to handle timestamp + recvWindow
+        - signs with HMAC-SHA256
+        - raises for HTTP errors
+        """
+        import requests, hmac, hashlib
+        from urllib.parse import urlencode
+
         if payload is None:
             payload = {}
+
         signed = self._signed_params(payload.copy())
         query_string = urlencode(signed)
-        signature = hmac.new(self.api_secret.encode("utf-8"),
-                             query_string.encode("utf-8"),
-                             hashlib.sha256).hexdigest()
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
         signed["signature"] = signature
+
         url = f"{self._base_url}{endpoint}"
-        headers = {"X-MBX-APIKEY": self.api_key, "Content-Type": "application/json"}
+        headers = {"X-MBX-APIKEY": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
         sess = self._session or requests
-        resp = sess.post(url, headers=headers, json=signed, timeout=timeout)
+
+        resp = sess.post(url, headers=headers, data=signed, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
