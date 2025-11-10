@@ -180,18 +180,30 @@ class BinanceClient:
             logger.warning("[Time Sync] Failed to sync time: %s", e)
 
     def _signed_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Build signed params with adjusted timestamp."""
+        """Attach signed params with an automatically refreshed server timestamp."""
+        import time, logging
+        logger = logging.getLogger(__name__)
+
         if params is None:
             params = {}
-        if not hasattr(self, "time_offset") or self.time_offset == 0:
-            try:
-                self._sync_time_offset()
-            except Exception:
-                pass
 
-        ts = int(time.time() * 1000) + int(self.time_offset or 0)
-        params.update({"timestamp": int(ts), "recvWindow": 60000})
+        now_ms = int(time.time() * 1000)
+
+        try:
+            # Refresh offset if missing or stale (older than 30 seconds)
+            if not hasattr(self, "time_offset") or not hasattr(self, "_last_time_sync") \
+            or abs(now_ms - getattr(self, "_last_time_sync", 0)) > 30_000:
+                self._sync_time_offset()
+                self._last_time_sync = now_ms
+                logger.debug("[TimeSync] Refreshed offset for signing")
+        except Exception as e:
+            logger.debug("[TimeSync] Failed to refresh offset: %s", e)
+
+        # Use adjusted timestamp
+        ts = now_ms + int(getattr(self, "time_offset", 0))
+        params.update({"timestamp": ts, "recvWindow": 60000})
         return params
+
 
     def _rest_signed_get(
         self, endpoint: str, params: Optional[Dict[str, Any]] = None, timeout: int = 5
@@ -841,37 +853,49 @@ class BinanceClient:
 
 
     # REST POST helper (signed)
-    def _rest_signed_post(
-        self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10
-    ) -> Dict[str, Any]:
-        """
-        Robust signed POST request to Binance:
-        - uses _signed_params() to handle timestamp + recvWindow
-        - signs with HMAC-SHA256
-        - raises for HTTP errors
-        """
-        import requests, hmac, hashlib
+    def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
+        """Perform a signed POST request to Binance Futures REST endpoint, with full debug and error handling."""
+        import requests, hmac, hashlib, time, logging
         from urllib.parse import urlencode
 
+        logger = logging.getLogger(__name__)
         if payload is None:
             payload = {}
 
-        signed = self._signed_params(payload.copy())
-        query_string = urlencode(signed)
-        signature = hmac.new(
-            self.api_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        signed["signature"] = signature
+        try:
+            signed = self._signed_params(payload.copy())
+            query_string = urlencode(signed)
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256
+            ).hexdigest()
+            signed["signature"] = signature
 
-        url = f"{self._base_url}{endpoint}"
-        headers = {"X-MBX-APIKEY": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
-        sess = self._session or requests
+            url = f"{self._base_url}{endpoint}"
+            headers = {
+                "X-MBX-APIKEY": self.api_key,
+                "Content-Type": "application/json",
+            }
 
-        resp = sess.post(url, headers=headers, data=signed, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
+            sess = self._session or requests
+            logger.debug(f"[REST] POST {url} payload={signed}")
+
+            resp = sess.post(url, headers=headers, json=signed, timeout=timeout)
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                # Log the error response body if available
+                msg = getattr(e.response, "text", "")
+                logger.error(f"[REST ERROR] {e} | body={msg}")
+                raise  # rethrow to propagate upward
+
+            return resp.json()
+
+        except Exception as e:
+            logger.exception(f"[REST POST FAILED] {endpoint} | {e}")
+            raise
+
 
     # ==================================================================
     # Leverage / Balance / Position Size
