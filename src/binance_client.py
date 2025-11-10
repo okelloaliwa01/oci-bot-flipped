@@ -106,6 +106,46 @@ def _safe_api_call(max_retries: int = 5, backoff: float = 2.0):
         return wrapper
     return decorator
 
+def retry_with_time_sync(max_attempts=3, delay=1.0):
+    """
+    Decorator to retry a function up to max_attempts.
+    Before each retry, sync the server time to avoid -1102 timestamp errors.
+    """
+    import functools
+    import time
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            attempts = 0
+            while attempts < max_attempts:
+                try:
+                    return func(self, *args, **kwargs)
+                except requests.exceptions.HTTPError as e:
+                    # Detect -1102 error in response text
+                    if e.response is not None and e.response.text:
+                        if "-1102" in e.response.text:
+                            # Sync time before retrying
+                            try:
+                                server_time = self.client.futures_time()
+                                if isinstance(server_time, dict) and "serverTime" in server_time:
+                                    offset = server_time["serverTime"] - int(time.time() * 1000)
+                                    self.client.time_offset = offset
+                                    logger.debug("[retry] Time offset refreshed: %d ms", offset)
+                            except Exception as sync_err:
+                                logger.warning("[retry] Time sync failed: %s", sync_err)
+                    attempts += 1
+                    logger.warning("[retry] Attempt %d/%d failed: %s", attempts, max_attempts, e)
+                    time.sleep(delay)
+                except Exception as e:
+                    attempts += 1
+                    logger.warning("[retry] Attempt %d/%d unexpected error: %s", attempts, max_attempts, e)
+                    time.sleep(delay)
+            # After max attempts, raise
+            raise RuntimeError(f"Function {func.__name__} failed after {max_attempts} attempts")
+        return wrapper
+    return decorator
+
 
 # ======================================================================
 # BinanceClient
@@ -697,6 +737,7 @@ class BinanceClient:
         return resp.json()
     
         # === Universal order placement (for TP/SL compatibility) ===
+    @retry_with_time_sync(max_attempts=3, delay=0.5)
     def place_order(self, **kwargs) -> dict:
         """
         Generic order wrapper used by ExecutionManager.create_tp_sl_orders().
@@ -824,6 +865,7 @@ class BinanceClient:
         # ============================================================
     # 🔹 Compatibility: futures_create_order Alias
     # ============================================================
+    @retry_with_time_sync(max_attempts=3, delay=0.5)
     def futures_create_order(self, **kwargs) -> dict:
         """
         Compatibility alias for futures_create_order() used by ExecutionManager & SmartExitManager.
@@ -897,47 +939,52 @@ class BinanceClient:
 
     # REST POST helper (signed)
     def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
-        """Perform a signed POST request to Binance Futures REST endpoint, with full debug and error handling."""
-        import requests, hmac, hashlib, time, logging
+        """
+        Send a signed POST request to Binance REST endpoint with automatic timestamp adjustment.
+        Ensures -1102 errors (missing timestamp) are avoided.
+        """
+        import time
+        import requests
         from urllib.parse import urlencode
 
-        logger = logging.getLogger(__name__)
         if payload is None:
             payload = {}
 
-        try:
-            signed = self._signed_params(payload.copy())
-            query_string = urlencode(signed)
-            signature = hmac.new(
-                self.api_secret.encode("utf-8"),
-                query_string.encode("utf-8"),
-                hashlib.sha256
-            ).hexdigest()
-            signed["signature"] = signature
-
-            url = f"{self._base_url}{endpoint}"
-            headers = {
-                "X-MBX-APIKEY": self.api_key,
-                "Content-Type": "application/json",
-            }
-
-            sess = self._session or requests
-            logger.debug(f"[REST] POST {url} payload={signed}")
-
-            resp = sess.post(url, headers=headers, json=signed, timeout=timeout)
+        # Ensure client has time_offset
+        if not hasattr(self, "time_offset") or self.time_offset is None:
             try:
-                resp.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                # Log the error response body if available
-                msg = getattr(e.response, "text", "")
-                logger.error(f"[REST ERROR] {e} | body={msg}")
-                raise  # rethrow to propagate upward
+                self._sync_time_offset()
+            except Exception:
+                self.time_offset = 0
 
+        # Apply timestamp
+        ts = int(time.time() * 1000) + int(self.time_offset or 0)
+        payload.update({"timestamp": ts, "recvWindow": 60000})
+
+        # Compute signature
+        query_string = urlencode(payload)
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        payload["signature"] = signature
+
+        url = f"{self.API_URL}{endpoint}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        try:
+            resp = requests.post(url, headers=headers, params=payload, timeout=timeout)
+            resp.raise_for_status()
             return resp.json()
-
-        except Exception as e:
-            logger.exception(f"[REST POST FAILED] {endpoint} | {e}")
+        except requests.HTTPError as e:
+            # Optional: log full payload for debugging
+            logger.error("[_rest_signed_post] 400/HTTPError: %s | payload=%s", e, payload)
             raise
+        except requests.RequestException as e:
+            logger.error("[_rest_signed_post] Request failed: %s", e)
+            raise
+
 
 
     # ==================================================================
