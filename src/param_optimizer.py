@@ -36,6 +36,7 @@ import csv
 # Local project imports (assumes module path resolves)
 from binance_client import BinanceClient
 import config
+from guards.market_integrity import MarketIntegrityGuard
 
 # ---------------------------
 # Configuration (local overrides)
@@ -410,6 +411,10 @@ def set_env_var(key: str, value: Any, env_path: Path = ENV_PATH):
 # Evaluate / wrapper
 # ---------------------------
 def evaluate_fold_wrapper(args):
+    """
+    Evaluate a data fold under given trade parameters + simulated market guard.
+    Returns sharpe, drawdown, guard penalty, and trade list.
+    """
     subset, params = args
     closes = [float(k[4]) for k in subset]
     ema_fast = compute_ema(closes, CONFIG["EMA_FAST"])
@@ -417,14 +422,49 @@ def evaluate_fold_wrapper(args):
     rsi = compute_rsi(closes, CONFIG["RSI_PERIOD"])
     _, _, macd_hist = compute_macd(closes, CONFIG["MACD_FAST"], CONFIG["MACD_SLOW"], CONFIG["MACD_SIGNAL"])
     atrs = compute_atr_from_klines(subset)
+
     trades: List[TradeResult] = []
-    for idx in find_entries(subset, CONFIG["ENTRY_LOOKBACK"], CONFIG["ENTRY_THRESHOLD"], ema_fast, ema_slow, rsi, macd_hist):
+    for idx in find_entries(subset, CONFIG["ENTRY_LOOKBACK"], CONFIG["ENTRY_THRESHOLD"],
+                            ema_fast, ema_slow, rsi, macd_hist):
         tr = simulate_trade_from_index(subset, idx, params, atrs, CONFIG["LEVERAGE"])
         if tr is not None:
             trades.append(tr)
+
     metrics = score_trades(trades)
-    # Return both metrics and trades (trades useful for final backtest)
-    return {"sharpe": metrics["sharpe_like"], "dd": metrics["max_drawdown"], "trades": trades}
+
+    # >>> PATCH: Guard simulation
+    guard = MarketIntegrityGuard(
+        spread_mult=float(os.getenv("SPREAD_MULT", 6.0)),
+        imbalance_limit=float(os.getenv("IMBALANCE_LIMIT", 0.9)),
+        book_event_limit=int(os.getenv("BOOK_EVENT_LIMIT", 200)),
+        taker_imbal_limit=float(os.getenv("TAKER_IMBAL_LIMIT", 0.85)),
+    )
+
+    # Synthetic orderbook events to estimate guard aggressiveness
+    guard_hits = 0
+    for i in range(10, len(subset) - 10, 5):
+        # Approximate bid/ask spread using close-to-close deltas
+        spread = abs(closes[i] - closes[i - 1])
+        fake_book = {
+            "bids": [[closes[i] - spread / 2, 1.0]],
+            "asks": [[closes[i] + spread / 2, 1.0]]
+        }
+        fake_trades = [{"qty": 1.0, "side": "buy" if closes[i] > closes[i - 1] else "sell"}]
+        events_per_sec = random.uniform(50, 400)
+        suspicious, reason = guard.check(fake_book, fake_trades, events_per_sec)
+        if suspicious:
+            guard_hits += 1
+
+    guard_penalty = guard_hits / max(1, len(subset) // 5)
+    # <<< PATCH END
+
+    return {
+        "sharpe": metrics["sharpe_like"],
+        "dd": metrics["max_drawdown"],
+        "guard_penalty": guard_penalty,
+        "trades": trades,
+    }
+
 
 # ---------------------------
 # Utility: plot equity curve
@@ -546,6 +586,7 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
 
     # === STEP 5: Define Optuna objective ===
     def objective(trial: Any) -> float:
+        # --- Core trade parameters (unchanged) ---
         params = Params(
             use_percent_margin=trial.suggest_categorical("use_percent_margin", [True, False]),
             margin_percent=trial.suggest_float("margin_percent", 0.1, 5.0),
@@ -561,25 +602,45 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
             tp2_pct=trial.suggest_float("tp2_pct", 0.1, 0.8),
         )
 
+        # --- Guard parameters (added) ---
+        guard_params = {
+            "SPREAD_MULT": trial.suggest_float("SPREAD_MULT", 2.0, 10.0),
+            "IMBALANCE_LIMIT": trial.suggest_float("IMBALANCE_LIMIT", 0.6, 1.0),
+            "BOOK_EVENT_LIMIT": trial.suggest_int("BOOK_EVENT_LIMIT", 50, 500),
+            "TAKER_IMBAL_LIMIT": trial.suggest_float("TAKER_IMBAL_LIMIT", 0.5, 1.0),
+        }
+        for k, v in guard_params.items():
+            os.environ[k] = str(v)
+
+        # Normalize take-profit allocation
         ssum = params.tp1_pct + params.tp2_pct
         if ssum > 1.0:
             params.tp1_pct /= ssum
             params.tp2_pct /= ssum
 
+        # Run evaluation across data folds
         args = [(d, params) for d in datasets]
         with concurrent.futures.ProcessPoolExecutor() as ex:
             results = list(ex.map(evaluate_fold_wrapper, args))
 
         sharpe_scores = [r["sharpe"] for r in results if r is not None]
         dd_scores = [r["dd"] for r in results if r is not None]
+        guard_scores = [r.get("guard_penalty", 0.0) for r in results if r is not None]
 
+        # Objective composition
         if not sharpe_scores:
             obj = -999.0
         else:
             avg_sharpe = statistics.mean(sharpe_scores)
             avg_dd = statistics.mean(dd_scores)
-            obj = CONFIG["OBJ_WEIGHT_SHARPE"] * avg_sharpe - CONFIG["OBJ_WEIGHT_DD"] * avg_dd
+            avg_guard = statistics.mean(guard_scores)
+            obj = (
+                CONFIG["OBJ_WEIGHT_SHARPE"] * avg_sharpe
+                - CONFIG["OBJ_WEIGHT_DD"] * avg_dd
+                - 0.1 * avg_guard  # penalty for over-triggering guard
+            )
 
+        # Log each trial
         with open(trials_csv, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -587,9 +648,14 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
                 params.use_percent_margin, params.margin_percent, params.margin_usdt,
                 params.atr_mult_tp1, params.atr_mult_tp2, params.atr_mult_sl,
                 params.trailing_start_atr, params.trailing_step_atr,
-                params.breakeven_atr, params.breakeven_buffer_pts, params.tp1_pct, params.tp2_pct
+                params.breakeven_atr, params.breakeven_buffer_pts,
+                params.tp1_pct, params.tp2_pct,
+                guard_params["SPREAD_MULT"], guard_params["IMBALANCE_LIMIT"],
+                guard_params["BOOK_EVENT_LIMIT"], guard_params["TAKER_IMBAL_LIMIT"]
             ])
+
         return obj
+
 
     # === STEP 6: Run optimization ===
     study = optuna.create_study(direction="maximize")
@@ -629,6 +695,10 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
             "BREAKEVEN_ATR": f"{best_params.get('breakeven_atr', 1.0):.6f}",
             "BREAKEVEN_BUFFER_PTS": f"{best_params.get('breakeven_buffer_pts', 0.5):.6f}",
             "TIMEFRAME_WEIGHTS": json.dumps(getattr(config, "TIMEFRAME_WEIGHTS", {})),
+            "SPREAD_MULT": f"{best_params.get('SPREAD_MULT', 6.0):.3f}",
+            "IMBALANCE_LIMIT": f"{best_params.get('IMBALANCE_LIMIT', 0.9):.3f}",
+            "BOOK_EVENT_LIMIT": int(best_params.get('BOOK_EVENT_LIMIT', 200)),
+            "TAKER_IMBAL_LIMIT": f"{best_params.get('TAKER_IMBAL_LIMIT', 0.85):.3f}",
         }.items():
             set_env_var(key, str(val))
         logger.info(".env updated with best params")
@@ -716,6 +786,14 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
                 backtest_out["metrics"].get("max_drawdown", 0),
                 backtest_out["metrics"].get("win_rate", 0))
     logger.info("==============================")
+
+    logger.info("Guard best parameters: %s", json.dumps({
+        "SPREAD_MULT": best_params.get("SPREAD_MULT", 6.0),
+        "IMBALANCE_LIMIT": best_params.get("IMBALANCE_LIMIT", 0.9),
+        "BOOK_EVENT_LIMIT": best_params.get("BOOK_EVENT_LIMIT", 200),
+        "TAKER_IMBAL_LIMIT": best_params.get("TAKER_IMBAL_LIMIT", 0.85),
+    }, indent=2))
+
 
     return best_params
 
