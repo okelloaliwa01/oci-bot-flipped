@@ -181,8 +181,8 @@ class ExecutionManager:
     # Open position (multi-TP + ATR retry)
     # ---------------------------
     def open_position(
-        self, symbol: str, direction: str, margin_usdt: float, tp_percent: float, sl_percent: float
-    ) -> Optional[Dict[str, Any]]:
+            self, symbol: str, direction: str, margin_usdt: float, tp_percent: float, sl_percent: float
+        ) -> Optional[Dict[str, Any]]:
         import os
         import statistics
         from datetime import datetime
@@ -194,7 +194,7 @@ class ExecutionManager:
         try:
             load_dotenv(override=True)
 
-            # --- Load ATR multipliers from environment
+            # 1️⃣ ATR multipliers from .env
             tp_env = os.getenv("ATR_MULT_TP", "2.0,3.0,4.0")
             sl_env = os.getenv("ATR_MULT_SL", "1.5")
             try:
@@ -208,14 +208,14 @@ class ExecutionManager:
                 logger.warning("⚠️ Invalid ATR_MULT_SL=%s — using default 1.5", sl_env)
                 sl_multiplier = 1.5
 
-            # --- Current price
+            # 2️⃣ Current price
             price_data = self.client.ticker_price(symbol)
             price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
             if not price or price <= 0:
                 logger.warning("Invalid price for %s: %s", symbol, price)
                 return None
 
-            # --- Symbol filters
+            # 3️⃣ Symbol filters
             tick_size = step_size = 0.0
             try:
                 info = self.client.get_symbol_info(symbol)
@@ -227,7 +227,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Failed to fetch symbol filters for %s: %s", symbol, e)
 
-            # --- ATR fallback calculation
+            # 4️⃣ ATR fallback
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 30)
@@ -241,12 +241,11 @@ class ExecutionManager:
                         if i > 0
                     ]
                     atr = statistics.fmean(trs[-14:])
-            except Exception:
-                logger.debug("ATR fallback failed for %s", symbol)
+            except Exception as e:
+                logger.debug("ATR fallback failed for %s: %s", symbol, e)
 
-            # --- Compute TP & SL (use ATR multipliers if available)
-            tp_levels = []
-            sl = None
+            # 5️⃣ Compute TP & SL
+            tp_levels, sl = [], None
             if atr and atr > 0:
                 if direction.upper() in ("LONG", "BUY"):
                     tp_levels = [price + atr * m for m in tp_multipliers]
@@ -255,7 +254,6 @@ class ExecutionManager:
                     tp_levels = [price - atr * m for m in tp_multipliers]
                     sl = price + atr * sl_multiplier
             else:
-                # fallback: percent-based (single TP)
                 if direction.upper() in ("LONG", "BUY"):
                     tp_levels = [price * (1 + tp_percent / 100.0)]
                     sl = price * (1 - sl_percent / 100.0)
@@ -263,11 +261,10 @@ class ExecutionManager:
                     tp_levels = [price * (1 - tp_percent / 100.0)]
                     sl = price * (1 + sl_percent / 100.0)
 
-            # Apply rounding to symbol precision (do rounding once here)
             tp_levels = [self._round_to(tp, tick_size) for tp in tp_levels]
             sl = self._round_to(sl, tick_size)
 
-            # --- Calculate position size
+            # 6️⃣ Quantity computation
             qty = self._calc_quantity(price, margin_usdt)
             qty = self._round_to(qty, step_size)
             if qty <= 0:
@@ -280,7 +277,7 @@ class ExecutionManager:
                 position_type, symbol, price, qty, tp_levels, sl, atr or 0.0
             )
 
-            # --- Dry run
+            # 7️⃣ Dry-run
             if self.dry_run:
                 tracked = {
                     "symbol": symbol,
@@ -291,18 +288,17 @@ class ExecutionManager:
                     "sl": sl,
                     "atr": atr,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "dry_run": True,
+                    "status": "DRY_RUN",
                 }
                 self.open_positions[symbol] = tracked
+                logger.info("🧪 DRY-RUN simulated %s position for %s", position_type, symbol)
                 return tracked
 
-            # --- MarketIntegrityGuard pre-check (interprets tier suffix)
+            # 8️⃣ MarketIntegrityGuard
             orderbook = self._fetch_orderbook(symbol)
             recent_trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, recent_trades, events_per_sec=0.0)
-
-            # reason may be like "depth_imbalance_ask_-0.943|RETRY" or "...|BLOCK" or "...|LOG"
-            action = None
+            action, reason_base = None, None
             if isinstance(reason, str) and "|" in reason:
                 parts = reason.split("|")
                 if len(parts) >= 2:
@@ -314,129 +310,95 @@ class ExecutionManager:
                 reason_base = reason
 
             if suspect:
-                # Decide based on action suffix
                 if action == "BLOCK":
-                    # permanent block - mark as failed and do not retry
-                    pending = {
-                        "symbol": symbol,
-                        "side": position_type,
-                        "entry": price,
-                        "qty": qty,
-                        "tp_levels": tp_levels,
-                        "sl": sl,
-                        "atr": atr,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "status": "FAILED_BLOCK",
-                        "suspect_reason": reason_base or reason,
-                    }
+                    pending = {"symbol": symbol, "side": position_type, "entry": price, "qty": qty,
+                            "tp_levels": tp_levels, "sl": sl, "atr": atr, "timestamp": datetime.utcnow().isoformat(),
+                            "status": "FAILED_BLOCK", "suspect_reason": reason_base or reason}
                     self.open_positions[symbol] = pending
                     logger.error("🚫 MarketIntegrityGuard BLOCK for %s: %s", symbol, reason)
                     return pending
-
-                elif action == "RETRY" or action is None:
-                    # retryable: create/extend pending entry and schedule retry/backoff
+                else:  # RETRY / LOG / fallback
                     pending = self.open_positions.get(symbol, {})
                     retries = pending.get("retry_count", 0)
-                    # scale initial backoff by ATR magnitude to avoid rapid retries in noisy markets
                     initial_backoff = self.retry_interval * (abs(atr) if atr and atr > 0 else 1.0)
                     backoff = pending.get("retry_backoff", initial_backoff)
-
                     if retries >= self.max_retries:
                         pending["status"] = "FAILED_MAX_RETRIES"
                         self.open_positions[symbol] = pending
-                        logger.error("Max retries reached for %s; marking FAILED_MAX_RETRIES", symbol)
+                        logger.error("Max retries reached for %s — marking FAILED_MAX_RETRIES", symbol)
                         return pending
-
                     pending.update({
-                        "symbol": symbol,
-                        "side": position_type,
-                        "entry": price,
-                        "qty": qty,
-                        "tp_levels": tp_levels,
-                        "sl": sl,
-                        "atr": atr,
+                        "symbol": symbol, "side": position_type, "entry": price, "qty": qty,
+                        "tp_levels": tp_levels, "sl": sl, "atr": atr,
                         "timestamp": datetime.utcnow().isoformat(),
                         "status": "PENDING_SUSPECT",
                         "suspect_reason": reason_base or reason,
                         "retry_count": retries,
-                        "retry_backoff": backoff,
+                        "retry_backoff": backoff
                     })
                     self.open_positions[symbol] = pending
-                    logger.warning("⚠️ MarketIntegrityGuard flagged %s: %s — PENDING entry (retry %s)", symbol, reason, retries + 1)
+                    logger.warning("⚠️ MarketIntegrityGuard flagged %s: %s — PENDING entry (retry %s)",
+                                symbol, reason, retries + 1)
                     return pending
 
-                elif action == "LOG":
-                    # informational only: proceed
-                    logger.info("ℹ️ MarketIntegrityGuard INFO for %s: %s — proceeding with execution", symbol, reason)
-                else:
-                    # default: conservative retry
-                    pending = self.open_positions.get(symbol, {})
-                    retries = pending.get("retry_count", 0)
-                    backoff = pending.get("retry_backoff", self.retry_interval)
-                    pending.update({
-                        "symbol": symbol,
-                        "side": position_type,
-                        "entry": price,
-                        "qty": qty,
-                        "tp_levels": tp_levels,
-                        "sl": sl,
-                        "atr": atr,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "status": "PENDING_SUSPECT",
-                        "suspect_reason": reason,
-                        "retry_count": retries,
-                        "retry_backoff": backoff,
-                    })
-                    self.open_positions[symbol] = pending
-                    logger.warning("⚠️ MarketIntegrityGuard flagged (unknown action) for %s: %s — PENDING", symbol, reason)
-                    return pending
-
-            # --- Execute entry order
+            # 9️⃣ Execute market order
             try:
-                self.client.futures_create_order(
+                logger.debug("Placing market order: %s %s qty=%.6f", position_type, symbol, qty)
+                order = self.client.futures_create_order(
                     symbol=symbol,
                     side="BUY" if position_type == "LONG" else "SELL",
                     type="MARKET",
                     quantity=qty,
                 )
-                logger.info("✅ Opened %s %s | entry=%.2f qty=%.6f", position_type, symbol, price, qty)
+                logger.debug("Order response: %s", order)
+                order_id = None
+                if isinstance(order, dict):
+                    order_id = order.get("orderId") or order.get("order_id") or order.get("id")
+                logger.info("✅ Opened %s %s | entry=%.2f qty=%.6f order_id=%s", position_type, symbol, price, qty,
+                            order_id or "?")
             except Exception as e:
-                logger.error("Market order failed for %s: %s", symbol, e)
-                return None
+                logger.exception("❌ Market order failed for %s", symbol)
+                pending = {"symbol": symbol, "side": position_type, "entry": price, "qty": qty,
+                        "tp_levels": tp_levels, "sl": sl, "atr": atr,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "PENDING_ORDER_FAILED",
+                        "error": str(e), "error_detail": repr(e),
+                        "retry_count": 0, "retry_backoff": self.retry_interval}
+                self.open_positions[symbol] = pending
+                return pending
 
-            # --- SmartExit: multi-TP (pass tp_levels explicitly)
-            if USE_SMART_EXIT:
-                try:
+            # 🔟 SmartExit integration
+            try:
+                smartexit_err = None
+                if USE_SMART_EXIT:
                     self.smart_exit.create_exit_orders(
-                        symbol=symbol,
-                        side=position_type,
-                        entry_price=price,
-                        qty=qty,
-                        atr_value=atr,
-                        tick_size=tick_size,
-                        step_size=step_size,
-                        tp_levels=tp_levels,
+                        symbol=symbol, side=position_type, entry_price=price, qty=qty,
+                        atr_value=atr, tick_size=tick_size, step_size=step_size, tp_levels=tp_levels
                     )
-                except Exception as e:
-                    logger.error("SmartExit.create_exit_orders failed for %s: %s", symbol, e)
+            except Exception as e:
+                logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
+                smartexit_err = str(e)
 
-            # --- Track position
+            # 1️⃣1️⃣ Track opened position
             tracked = {
-                "side": position_type,
-                "entry": price,
-                "qty": qty,
-                "tp_levels": tp_levels,
-                "sl": sl,
-                "atr": atr,
+                "symbol": symbol, "side": position_type, "entry": price, "qty": qty,
+                "tp_levels": tp_levels, "sl": sl, "atr": atr,
                 "timestamp": datetime.utcnow().isoformat(),
-                "status": "OPEN",
+                "status": "OPEN", "order_result": order, "order_id": order_id, "smartexit_error": smartexit_err
             }
             self.open_positions[symbol] = tracked
             return tracked
 
         except Exception as e:
             logger.exception("Unhandled error in open_position(%s): %s", symbol, e)
-            return None
+            failure = {"symbol": symbol, "status": "FAILED_UNHANDLED",
+                    "error": str(e), "error_detail": repr(e),
+                    "timestamp": datetime.utcnow().isoformat()}
+            self.open_positions[symbol] = failure
+            return failure
+
+
+
 
     # ---------------------------
     # Pending retry loop
