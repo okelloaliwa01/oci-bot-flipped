@@ -941,27 +941,32 @@ class BinanceClient:
     def _rest_signed_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
         """
         Send a signed POST request to Binance REST endpoint with automatic timestamp adjustment.
-        Ensures -1102 errors (missing timestamp) are avoided.
+        Works with both mainnet and testnet by using self._base_url.
         """
         import time
+        import hmac
+        import hashlib
         import requests
         from urllib.parse import urlencode
+        import logging
+
+        logger = logging.getLogger(__name__)
 
         if payload is None:
             payload = {}
 
-        # Ensure client has time_offset
+        # Ensure time offset is known
         if not hasattr(self, "time_offset") or self.time_offset is None:
             try:
                 self._sync_time_offset()
             except Exception:
                 self.time_offset = 0
 
-        # Apply timestamp
+        # Attach timestamp
         ts = int(time.time() * 1000) + int(self.time_offset or 0)
         payload.update({"timestamp": ts, "recvWindow": 60000})
 
-        # Compute signature
+        # Generate signature
         query_string = urlencode(payload)
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
@@ -970,7 +975,9 @@ class BinanceClient:
         ).hexdigest()
         payload["signature"] = signature
 
-        url = f"{self.API_URL}{endpoint}"
+        # ✅ FIX: use self._base_url instead of self.API_URL
+        url = f"{self._base_url}{endpoint}"
+
         headers = {"X-MBX-APIKEY": self.api_key}
 
         try:
@@ -978,12 +985,12 @@ class BinanceClient:
             resp.raise_for_status()
             return resp.json()
         except requests.HTTPError as e:
-            # Optional: log full payload for debugging
-            logger.error("[_rest_signed_post] 400/HTTPError: %s | payload=%s", e, payload)
+            logger.error("[_rest_signed_post] HTTPError: %s | Response: %s | Payload=%s", e, resp.text, payload)
             raise
         except requests.RequestException as e:
             logger.error("[_rest_signed_post] Request failed: %s", e)
             raise
+
 
 
 
