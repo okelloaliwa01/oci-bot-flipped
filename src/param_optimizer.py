@@ -686,7 +686,7 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
         for key, val in {
             "USE_PERCENT_MARGIN": best_params.get("use_percent_margin", False),
             "MARGIN_PERCENT": f"{best_params.get('margin_percent', 1.0):.6f}",
-            "MARGIN_USDT": f"{best_params.get('margin_usdt', 3.0):.6f}",
+            #"MARGIN_USDT": f"{best_params.get('margin_usdt', 3.0):.6f}",
             "TP_PERCENT": f"{best_params.get('tp1_pct', 0.5):.6f}",
             "SL_PERCENT": f"{best_params.get('tp2_pct', 0.18):.6f}",
             "ATR_MULT_SL": f"{best_params.get('atr_mult_sl', 1.5):.6f}",
