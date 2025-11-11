@@ -660,6 +660,12 @@ class BinanceClient:
 
         return balance
 
+        # === Compatibility alias (for older call sites) ===
+    def futures_account_balance(self, *args, **kwargs):
+        """Alias for get_futures_account_balance() for backward compatibility."""
+        return self.get_futures_account_balance(*args, **kwargs)
+
+
     def fetch_and_persist_balance(self, asset: str = "USDT", env_path: Optional[Path] = None) -> Optional[float]:
         """
         Convenience: fetch the available balance and persist to .env as ACCOUNT_BALANCE.
