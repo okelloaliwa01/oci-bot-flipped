@@ -382,7 +382,8 @@ class ExecutionManager:
             sl = self._round_to(sl, tick)
 
             # --- 8️⃣ Adaptive margin & dynamic qty ---
-            balances = self.client.futures_account_balance()
+            #balances = self.client.futures_account_balance()
+            balances = self.client.account_balance()
             usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
             margin_percent = float(os.getenv("MARGIN_PERCENT", "0.1"))
             margin_usdt = usdt_balance * margin_percent
