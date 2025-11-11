@@ -254,7 +254,7 @@ def run():
 
                     if mtf_ok and not has_pos:
                         try:
-                            res = exec_m.open_position(SYMBOL, ptype, MARGIN_USDT, TP_PERCENT, SL_PERCENT)
+                            res = exec_m.open_position(SYMBOL, ptype, TP_PERCENT, SL_PERCENT)
                             logger.info(f"✅ Trade Result: {res}")
                             send_telegram(f"🚀 {ptype} entry executed: {res}")
                             cooldown_candles = POST_TRADE_COOLDOWN
@@ -315,7 +315,7 @@ def run():
                     continue
 
                 try:
-                    res = exec_m.open_position(SYMBOL, signal_side, MARGIN_USDT, TP_PERCENT, SL_PERCENT)
+                    res = exec_m.open_position(SYMBOL, signal_side, TP_PERCENT, SL_PERCENT)
                     logger.info(f"✅ {signal_side} trade executed: {res}")
                     send_telegram(f"🚀 {SYMBOL} {signal_side} position opened: {res}")
                     cooldown_candles = POST_TRADE_COOLDOWN
