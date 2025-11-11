@@ -40,6 +40,38 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def get_dynamic_position_size(client, symbol: str, margin_usdt: float, leverage: int = 10) -> float:
+    """
+    Dynamically scale position size to avoid margin insufficient errors.
+    - Uses available USDT balance
+    - Applies leverage
+    - Returns the position size in BASE asset (e.g. BTC quantity)
+    """
+    try:
+        # Fetch futures account balance
+        balances = client.futures_account_balance()
+        usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
+
+        # Limit margin_usdt to 90% of balance
+        allowed_margin = min(margin_usdt, usdt_balance * 0.9)
+
+        # Get current price
+        price_data = client.futures_symbol_ticker(symbol=symbol)
+        mark_price = float(price_data["price"])
+
+        # Compute position quantity
+        position_qty = round((allowed_margin * leverage) / mark_price, 3)  # round to 0.001 precision
+
+        if position_qty <= 0:
+            raise ValueError("Insufficient margin even for minimum order size.")
+
+        return position_qty
+
+    except Exception as e:
+        logging.error(f"[get_dynamic_position_size] Failed to compute position size: {e}")
+        return 0.0
+
+
 
 class ExecutionManager:
     """
@@ -259,18 +291,18 @@ class ExecutionManager:
         self,
         symbol: str,
         direction: str,
-        margin_usdt: float,
         tp_percent: float,
         sl_percent: float,
     ) -> Optional[Dict[str, Any]]:
         """
-        Hybrid patched position opener:
-        - Uses Binance SDK futures_create_order (avoids _rest_signed_post issues)
-        - Fixes -1102 timestamp error by syncing server time
+        Fully self-contained position opener:
+        - Dynamically calculates margin based on ACCOUNT_BALANCE * MARGIN_PERCENT
+        - Dynamically calculates position size to avoid margin errors
         - Supports ATR fallback TP/SL, SmartExit, dry-run, logging
-        - Includes MarketIntegrityGuard and quantity validation
+        - Includes MarketIntegrityGuard
         """
         import os
+        import time
         import statistics
         import logging
         from datetime import datetime
@@ -279,13 +311,13 @@ class ExecutionManager:
         logger = logging.getLogger(__name__)
 
         try:
-            # --- Load environment ---
+            # --- 1️⃣ Load environment ---
             try:
                 load_dotenv(override=True)
             except Exception:
                 pass
 
-            # --- 1️⃣ Sync server time to avoid -1102 ---
+            # --- 2️⃣ Sync server time ---
             try:
                 server_time = self.client.futures_time()
                 if isinstance(server_time, dict) and "serverTime" in server_time:
@@ -294,18 +326,18 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Server time sync failed: %s", e)
 
-            # --- 2️⃣ ATR multipliers ---
+            # --- 3️⃣ ATR multipliers ---
             tp_mults = [float(x) for x in os.getenv("ATR_MULT_TP", "2.0,3.0,4.0").split(",") if x.strip()]
             sl_mult = float(os.getenv("ATR_MULT_SL", "1.5"))
 
-            # --- 3️⃣ Current price ---
+            # --- 4️⃣ Current price ---
             price_data = self.client.ticker_price(symbol)
             price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
             if not price or price <= 0:
                 logger.warning(f"⚠️ Invalid price for {symbol}: {price}")
                 return None
 
-            # --- 4️⃣ Symbol filters ---
+            # --- 5️⃣ Symbol filters ---
             tick, step, min_qty, min_notional = 0.0, 0.0, None, None
             try:
                 info = self.client.get_symbol_info(symbol) or {}
@@ -322,7 +354,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Filter fetch failed for %s: %s", symbol, e)
 
-            # --- 5️⃣ ATR fallback ---
+            # --- 6️⃣ ATR fallback ---
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 30) or []
@@ -338,7 +370,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("ATR fetch failed: %s", e)
 
-            # --- 6️⃣ Compute TP & SL ---
+            # --- 7️⃣ Compute TP & SL ---
             is_long = direction.upper() in ("LONG", "BUY")
             if atr and atr > 0:
                 tp_levels = [price + atr * m if is_long else price - atr * m for m in tp_mults]
@@ -349,13 +381,25 @@ class ExecutionManager:
             tp_levels = [self._round_to(tp, tick) for tp in tp_levels]
             sl = self._round_to(sl, tick)
 
-            # --- 7️⃣ Quantity ---
-            qty = self._round_to(self._calc_quantity(price, margin_usdt), step)
-            if qty <= 0:
-                logger.warning("Invalid qty computed for %s", symbol)
+            # --- 8️⃣ Adaptive margin & dynamic qty ---
+            balances = self.client.futures_account_balance()
+            usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
+            margin_percent = float(os.getenv("MARGIN_PERCENT", "0.1"))
+            margin_usdt = usdt_balance * margin_percent
+            leverage = int(os.getenv("LEVERAGE", "10"))
+
+            try:
+                mark_price = float(self.client.futures_symbol_ticker(symbol=symbol)["price"])
+                qty = max(round((margin_usdt * leverage) / mark_price, 3), 0.001)
+                qty = self._round_to(qty, step)
+                if qty <= 0:
+                    logger.warning("Invalid qty computed for %s", symbol)
+                    return None
+            except Exception as e:
+                logger.error(f"Failed to compute dynamic quantity: {e}")
                 return None
 
-            # --- 8️⃣ Dry-run ---
+            # --- 9️⃣ Dry-run ---
             if self.dry_run:
                 pos = {
                     "symbol": symbol, "side": direction,
@@ -368,7 +412,7 @@ class ExecutionManager:
                 logger.info("🧪 DRY-RUN: %s %s", direction, symbol)
                 return pos
 
-            # --- 9️⃣ MarketIntegrityGuard ---
+            # --- 🔟 MarketIntegrityGuard ---
             orderbook = self._fetch_orderbook(symbol)
             trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, trades, events_per_sec=0.0)
@@ -388,14 +432,14 @@ class ExecutionManager:
                 self.open_positions[symbol] = pending
                 return pending
 
-            # --- 🔟 Leverage & hedge detection ---
+            # --- 1️⃣1️⃣ Set leverage ---
             try:
                 if hasattr(self.client, "futures_change_leverage"):
-                    self.client.futures_change_leverage(symbol=symbol, leverage=int(os.getenv("LEVERAGE", "10")))
+                    self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             except Exception as le:
                 logger.debug("Leverage set failed: %s", le)
 
-            # --- 1️⃣1️⃣ Validation ---
+            # --- 1️⃣2️⃣ Validation ---
             if min_qty is not None and qty < float(min_qty):
                 failure = {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"qty<{min_qty}"}
                 self.open_positions[symbol] = failure
@@ -407,7 +451,7 @@ class ExecutionManager:
                 logger.error("Notional validation failed for %s: notional=%.8f minNotional=%s", symbol, qty * price, min_notional)
                 return failure
 
-            # --- 1️⃣2️⃣ Place Market Order (SDK call, safe) ---
+            # --- 1️⃣3️⃣ Place Market Order ---
             try:
                 order_result = self.client.futures_create_order(
                     symbol=symbol,
@@ -433,7 +477,7 @@ class ExecutionManager:
                 self.open_positions[symbol] = pending
                 return pending
 
-            # --- 1️⃣3️⃣ SmartExit integration ---
+            # --- 1️⃣4️⃣ SmartExit integration ---
             smartexit_err = None
             if USE_SMART_EXIT:
                 try:
@@ -451,7 +495,7 @@ class ExecutionManager:
                     smartexit_err = str(e)
                     logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
 
-            # --- 1️⃣4️⃣ Track opened position ---
+            # --- 1️⃣5️⃣ Track opened position ---
             tracked = {
                 "symbol": symbol,
                 "side": direction,
@@ -480,43 +524,74 @@ class ExecutionManager:
             self.open_positions[symbol] = failure
             return failure
 
+
+
+
     # ---------------------------
     # Pending retry loop
     # ---------------------------
     def _pending_retry_loop(self) -> None:
-        while not self._stop_retry:
+        """
+        Continuously retries pending positions flagged as PENDING_SUSPECT.
+        Respects max_retries, exponential backoff, and updates self.open_positions accordingly.
+        """
+        import time
+        from datetime import datetime
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        while not getattr(self, "_stop_retry", False):
             try:
-                time.sleep(self.retry_interval)
-                pending = [(s, p) for s, p in self.open_positions.items() if p.get("status") == "PENDING_SUSPECT"]
+                time.sleep(getattr(self, "retry_interval", 5))  # default 5s if not set
+
+                # Collect all pending suspect positions
+                pending = [
+                    (symbol, pos)
+                    for symbol, pos in self.open_positions.items()
+                    if pos.get("status") == "PENDING_SUSPECT"
+                ]
+                # Sort by last retry timestamp (oldest first)
                 pending.sort(key=lambda x: x[1].get("last_retry_ts", datetime.min))
-                for symbol, p in pending:
-                    if self._stop_retry:
+
+                for symbol, pos in pending:
+                    if getattr(self, "_stop_retry", False):
                         break
-                    retries = p.get("retry_count", 0)
-                    backoff = p.get("retry_backoff", self.retry_interval)
-                    if retries >= self.max_retries:
-                        p["status"] = "FAILED_MAX_RETRIES"
-                        self.open_positions[symbol] = p
+
+                    retries = pos.get("retry_count", 0)
+                    backoff = pos.get("retry_backoff", getattr(self, "retry_interval", 5))
+
+                    if retries >= getattr(self, "max_retries", 5):
+                        pos["status"] = "FAILED_MAX_RETRIES"
+                        self.open_positions[symbol] = pos
                         logger.error("❌ Max retries reached for %s", symbol)
                         continue
 
-                    margin_usdt = (p.get("qty") or 0) * (p.get("entry") or 0)
-                    if margin_usdt <= 0:
-                        margin_usdt = MARGIN_USDT
-
                     logger.info("🔄 Retrying %s (attempt %s)", symbol, retries + 1)
-                    # call open_position again which will re-check guard & either place order or update pending entry
-                    self.open_position(symbol, p.get("side", "LONG"), margin_usdt, TP_PERCENT, SL_PERCENT)
 
-                    # update retry counters/backoff
-                    p = self.open_positions.get(symbol, p)  # refresh in case open_position updated it
-                    p["retry_count"] = p.get("retry_count", retries) + 1
-                    p["retry_backoff"] = p.get("retry_backoff", backoff) * self.retry_backoff
-                    p["last_retry_ts"] = datetime.utcnow()
-                    self.open_positions[symbol] = p
-                    time.sleep(p["retry_backoff"])
+                    # Call self-contained open_position (no margin_usdt)
+                    self.open_position(
+                        symbol,
+                        pos.get("side", "LONG"),
+                        getattr(self, "TP_PERCENT", 1.0),
+                        getattr(self, "SL_PERCENT", 1.0)
+                    )
+
+                    # Refresh updated position in case open_position modified it
+                    pos = self.open_positions.get(symbol, pos)
+
+                    # Update retry counters and backoff
+                    pos["retry_count"] = retries + 1
+                    pos["retry_backoff"] = backoff * getattr(self, "retry_backoff", 2.0)
+                    pos["last_retry_ts"] = datetime.utcnow()
+                    self.open_positions[symbol] = pos
+
+                    # Sleep for the current backoff before next retry
+                    time.sleep(pos["retry_backoff"])
+
             except Exception as e:
                 logger.exception("_pending_retry_loop error: %s", e)
+
 
     # ---------------------------
     # Stop retry thread
