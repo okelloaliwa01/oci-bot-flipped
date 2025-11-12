@@ -310,6 +310,91 @@ class ExecutionManager:
 
         logger = logging.getLogger(__name__)
 
+        def _safe_parse_tp_mults(raw) -> List[float]:
+            """Accept str/float/int/list and return list[float] fallbacking to defaults on error."""
+            defaults = [2.0, 3.0, 4.0]
+            try:
+                if raw is None:
+                    return defaults
+                # If environment loader already returned a list/tuple
+                if isinstance(raw, (list, tuple)):
+                    out = []
+                    for v in raw:
+                        try:
+                            out.append(float(v))
+                        except Exception:
+                            continue
+                    return out or defaults
+                # numeric already
+                if isinstance(raw, (int, float)):
+                    return [float(raw)]
+                # string
+                if isinstance(raw, str):
+                    raw_s = raw.strip()
+                    if not raw_s:
+                        return defaults
+                    parts = [p.strip() for p in raw_s.split(",") if p.strip()]
+                    out = []
+                    for p in parts:
+                        try:
+                            out.append(float(p))
+                        except Exception:
+                            continue
+                    return out or defaults
+            except Exception:
+                pass
+            return defaults
+
+        def _safe_parse_float(raw, default: float) -> float:
+            try:
+                return float(raw)
+            except Exception:
+                return default
+
+        def _extract_usdt_balance(balances_resp: Any) -> float:
+            """
+            Safely extract USDT balance from many shapes:
+            - list of dicts [{'asset':'USDT','balance':'123'}, ...]
+            - dict wrapping a list {'balances': [...]}
+            - single dict {'asset':'USDT','balance':'123'}
+            - dict mapping {'USDT': '123'}
+            - numeric or string numeric
+            """
+            try:
+                # list-like of dicts
+                if isinstance(balances_resp, (list, tuple)):
+                    for b in balances_resp:
+                        if not isinstance(b, dict):
+                            continue
+                        asset = str(b.get("asset", b.get("currency", "") or "")).upper()
+                        if asset == "USDT":
+                            return safe_float(b.get("balance") or b.get("free") or b.get("walletBalance") or 0.0, 0.0)
+                    return 0.0
+
+                # dict wrappers
+                if isinstance(balances_resp, dict):
+                    # direct mapping 'USDT': '123'
+                    if "USDT" in balances_resp:
+                        return safe_float(balances_resp.get("USDT"), 0.0)
+                    # common wrapper keys
+                    for key in ("balances", "assets", "accountBalances", "data"):
+                        inner = balances_resp.get(key)
+                        if isinstance(inner, (list, tuple)):
+                            return _extract_usdt_balance(inner)
+                    # single dict with asset + balance
+                    if "asset" in balances_resp and str(balances_resp.get("asset", "")).upper() == "USDT":
+                        return safe_float(balances_resp.get("balance") or balances_resp.get("free") or 0.0, 0.0)
+                    # sometimes balance number in dict under other keys
+                    for k, v in balances_resp.items():
+                        if isinstance(k, str) and k.upper() == "USDT":
+                            return safe_float(v, 0.0)
+                    return 0.0
+
+                # numeric or numeric-string
+                return safe_float(balances_resp, 0.0)
+            except Exception:
+                return 0.0
+
         try:
             # --- 1️⃣ Load environment ---
             try:
@@ -327,8 +412,11 @@ class ExecutionManager:
                 logger.debug("Server time sync failed: %s", e)
 
             # --- 3️⃣ ATR multipliers ---
-            tp_mults = [float(x) for x in os.getenv("ATR_MULT_TP", "2.0,3.0,4.0").split(",") if x.strip()]
-            sl_mult = float(os.getenv("ATR_MULT_SL", "1.5"))
+            raw_tp = os.getenv("ATR_MULT_TP", "2.0,3.0,4.0")
+            tp_mults = _safe_parse_tp_mults(raw_tp)
+
+            raw_sl = os.getenv("ATR_MULT_SL", "1.5")
+            sl_mult = _safe_parse_float(raw_sl, 1.5)
 
             # --- 4️⃣ Current price ---
             price_data = self.client.ticker_price(symbol)
@@ -382,8 +470,14 @@ class ExecutionManager:
             sl = self._round_to(sl, tick)
 
             # --- 8️⃣ Adaptive margin & dynamic qty ---
-            balances = self.client.futures_account_balance()
-            usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
+            balances = None
+            try:
+                balances = self.client.futures_account_balance()
+            except Exception as e:
+                logger.debug("futures_account_balance() call failed: %s", e)
+                balances = None
+
+            usdt_balance = _extract_usdt_balance(balances)
             margin_percent = float(os.getenv("MARGIN_PERCENT", "0.1"))
             margin_usdt = usdt_balance * margin_percent
             leverage = int(os.getenv("LEVERAGE", "10"))
@@ -523,6 +617,7 @@ class ExecutionManager:
             }
             self.open_positions[symbol] = failure
             return failure
+
 
 
 
