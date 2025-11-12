@@ -421,16 +421,15 @@ class SmartExitManager:
         atr: Optional[float] = None,
         tick_size: Optional[float] = None,
         step_size: Optional[float] = None,
-        tp_levels: Optional[list] = None,  # <-- New optional parameter
+        tp_levels: Optional[list] = None,  # Optional precomputed TP list
     ):
         import math
         import logging
 
-        # Ensure logger is always defined
         logger = logging.getLogger(__name__)
 
         try:
-            # Use provided ATR or fallback
+            # --- ATR validation ---
             atr = atr_value or atr
             if atr is None or atr <= 0:
                 logger.warning(f"[SmartExit] Missing or invalid ATR value for {symbol}. atr={atr}")
@@ -444,12 +443,12 @@ class SmartExitManager:
                 f"[SmartExit] Creating exit orders for {symbol} | side={side} | entry={entry_price:.2f} | ATR={atr:.4f} | qty={qty}"
             )
 
-            # --- Determine dry-run mode
+            # --- Dry-run mode ---
             global_dry = globals().get("DRY_RUN", False)
             instance_dry = getattr(self, "dry_run", None)
             dry_mode = instance_dry if instance_dry is not None else global_dry
 
-            # --- Fetch symbol filters
+            # --- Symbol filters ---
             try:
                 if not tick_size or not step_size:
                     info = self.client.get_symbol_info(symbol)
@@ -464,7 +463,7 @@ class SmartExitManager:
                 logger.warning(f"[SmartExit] Could not fetch symbol filters for {symbol}: {e}")
                 tick_size, step_size, min_qty, min_notional = 0.1, 0.001, 0.001, 5.0
 
-            # --- Precision helpers
+            # --- Precision helpers ---
             def snap_price(p):
                 if not tick_size or tick_size <= 0:
                     return float(p)
@@ -487,15 +486,17 @@ class SmartExitManager:
                     return snap_qty(q2)
                 return quantity
 
-            # --- Cancel any existing exit orders
+            # --- Cancel existing exits ---
             self.cancel_exit_orders_for_symbol(symbol)
 
-            # --- Compute TP/SL levels
+            # --- Compute TP/SL levels ---
             TP_MULTS = getattr(self, "atr_mult_tp", [2.0, 3.0, 4.0])
             SL_MULT = getattr(self, "atr_mult_sl", 1.5)
 
-            # If tp_levels provided externally, use them
             if tp_levels is not None:
+                # ✅ SAFETY FIX: ensure tp_levels is iterable
+                if isinstance(tp_levels, (int, float)):
+                    tp_levels = [tp_levels]
                 tp_levels = [snap_price(p) for p in tp_levels]
                 if side.upper() in ("LONG", "BUY"):
                     sl_price = snap_price(entry_price - atr * SL_MULT)
@@ -509,12 +510,18 @@ class SmartExitManager:
                     tp_levels = [snap_price(entry_price - atr * m) for m in TP_MULTS]
                     sl_price = snap_price(entry_price + atr * SL_MULT)
 
-            # Split quantity evenly for multi-TP
+            # --- Defensive filtering ---
+            tp_levels = [float(x) for x in tp_levels if x and x > 0]
+            if not tp_levels:
+                logger.warning(f"[SmartExit] No valid TP levels computed for {symbol}")
+                return None
+
+            # --- Partial qty allocation ---
             tp_count = len(tp_levels)
             partial_qty = max(qty / tp_count, min_qty)
             partial_qtys = [snap_qty(valid_notional(tp, partial_qty)) for tp in tp_levels]
 
-            # --- Dry-run mode
+            # --- Dry-run mode ---
             if dry_mode:
                 for tp_price, tp_qty in zip(tp_levels, partial_qtys):
                     logger.info(f"[SmartExit:DRYRUN] TP -> {symbol} SELL {tp_qty} @ {tp_price}")
@@ -528,7 +535,7 @@ class SmartExitManager:
                     "sl_price": sl_price,
                 }
 
-            # --- Place live TP orders
+            # --- Live TP orders ---
             tp_orders = []
             for tp_price, tp_qty in zip(tp_levels, partial_qtys):
                 payload = dict(
@@ -547,7 +554,7 @@ class SmartExitManager:
                 except Exception as e:
                     logger.error(f"[SmartExit] TP failed for {symbol} @ {tp_price}: {e}")
 
-            # --- Place SL
+            # --- Live SL order ---
             try:
                 payload = dict(
                     symbol=symbol,
@@ -575,6 +582,7 @@ class SmartExitManager:
         except Exception as e:
             logger.exception(f"[SmartExit:FATAL] Unexpected error in create_exit_orders: {e}")
             return None
+
 
 
 
