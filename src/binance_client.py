@@ -785,17 +785,23 @@ class BinanceClient:
                             tp_qtys: Optional[Union[float, List[float]]] = None) -> Dict[str, Any]:
         """Create TAKE_PROFIT_MARKET & STOP_MARKET orders."""
         self._init()
+
+        # 🔧 SAFETY FIX — normalize single floats/ints into lists
         if isinstance(tp_levels, (int, float)):
             tp_levels = [float(tp_levels)]
+        elif isinstance(tp_levels, (list, tuple)):
+            tp_levels = [float(x) for x in tp_levels if x is not None]
         else:
-            tp_levels = [float(x) for x in tp_levels]
+            tp_levels = []
 
         if tp_qtys is None:
             tp_qtys = [None] * len(tp_levels)
         elif isinstance(tp_qtys, (int, float)):
             tp_qtys = [float(tp_qtys)] * len(tp_levels)
+        elif isinstance(tp_qtys, (list, tuple)):
+            tp_qtys = [float(x) for x in tp_qtys if x is not None]
         else:
-            tp_qtys = [float(x) for x in tp_qtys]
+            tp_qtys = [None] * len(tp_levels)
 
         results = {"tp_results": [], "sl_result": None, "errors": []}
         try:
@@ -812,6 +818,7 @@ class BinanceClient:
                     adj_price = float(int(tp_price // tick) * tick)
                     if adj_price == tp_price:
                         adj_price = round(adj_price + tick, 8)
+
                 adj_qty = qty if qty is not None else 0.0
                 if adj_qty and step:
                     adj_qty = float(int(adj_qty // step) * step) if adj_qty >= step else step
@@ -819,6 +826,7 @@ class BinanceClient:
                     adj_qty = None  # let the caller decide or set from position
 
                 side_tp = "SELL" if side.upper() == "LONG" else "BUY"
+
                 # try SDK create
                 if hasattr(self._client, "new_order"):
                     resp = self._client.new_order(
@@ -831,14 +839,25 @@ class BinanceClient:
                     )
                 else:
                     # fallback REST signed: build payload and post
-                    payload = {"symbol": symbol, "side": side_tp, "type": "TAKE_PROFIT_MARKET", "stopPrice": str(adj_price)}
+                    payload = {
+                        "symbol": symbol,
+                        "side": side_tp,
+                        "type": "TAKE_PROFIT_MARKET",
+                        "stopPrice": str(adj_price)
+                    }
                     if adj_qty:
                         payload["quantity"] = adj_qty
                     resp = self._rest_signed_post("/fapi/v1/order", payload)
+
                 results["tp_results"].append(resp)
             except Exception as e:
                 logger.warning("TP creation error for %s at %s: %s", symbol, tp_price, e)
-                results["errors"].append({"type": "tp", "price": tp_price, "qty": qty, "error": str(e)})
+                results["errors"].append({
+                    "type": "tp",
+                    "price": tp_price,
+                    "qty": qty,
+                    "error": str(e)
+                })
 
         # --- SL creation ---
         try:
@@ -846,6 +865,7 @@ class BinanceClient:
             total_qty = sum([q for q in (tp_qtys or []) if q]) if tp_qtys else None
             adj_total_qty = float(int(total_qty // step) * step) if total_qty and step else total_qty
             side_sl = "SELL" if side.upper() == "LONG" else "BUY"
+
             if hasattr(self._client, "new_order"):
                 sl_resp = self._client.new_order(
                     symbol=symbol,
@@ -856,16 +876,27 @@ class BinanceClient:
                     quantity=adj_total_qty,
                 )
             else:
-                payload = {"symbol": symbol, "side": side_sl, "type": "STOP_MARKET", "stopPrice": str(adj_sl)}
+                payload = {
+                    "symbol": symbol,
+                    "side": side_sl,
+                    "type": "STOP_MARKET",
+                    "stopPrice": str(adj_sl)
+                }
                 if adj_total_qty:
                     payload["quantity"] = adj_total_qty
                 sl_resp = self._rest_signed_post("/fapi/v1/order", payload)
+
             results["sl_result"] = sl_resp
         except Exception as e:
             logger.warning("SL creation error for %s: %s", symbol, e)
-            results["errors"].append({"type": "sl", "price": sl_price, "error": str(e)})
+            results["errors"].append({
+                "type": "sl",
+                "price": sl_price,
+                "error": str(e)
+            })
 
         return results
+
     
 
         # ============================================================
