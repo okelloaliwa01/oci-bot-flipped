@@ -56,7 +56,7 @@ def get_dynamic_position_size(client, symbol: str, margin_usdt: float, leverage:
         allowed_margin = min(margin_usdt, usdt_balance * 0.9)
 
         # Get current price
-        price_data = client.futures_symbol_ticker(symbol=symbol)
+        price_data = client.ticker_price(symbol=symbol)
         mark_price = float(price_data["price"])
 
         # Compute position quantity
@@ -483,7 +483,7 @@ class ExecutionManager:
             leverage = int(os.getenv("LEVERAGE", "10"))
 
             try:
-                mark_price = float(self.client.futures_symbol_ticker(symbol=symbol)["price"])
+                mark_price = float(self.client.ticker_price(symbol=symbol)["price"])
                 qty = max(round((margin_usdt * leverage) / mark_price, 3), 0.001)
                 qty = self._round_to(qty, step)
                 if qty <= 0:
