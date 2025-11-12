@@ -60,15 +60,33 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _parse_csv_floats(s: Optional[str], fallback: List[float]) -> List[float]:
-    try:
-        if s is None:
-            return fallback
-        parts = [p.strip() for p in str(s).split(",") if p.strip()]
-        if not parts:
-            return fallback
-        return [safe_float(p) for p in parts]
-    except Exception:
+    """
+    Parse a comma-separated string of floats, returning a list of floats.
+    Falls back to the provided default if parsing fails or input is empty.
+
+    Examples:
+        "1.2,3.4" -> [1.2, 3.4]
+        ""        -> fallback
+        None      -> fallback
+    """
+    if not s:
         return fallback
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return fallback
+
+    result = []
+    for p in parts:
+        try:
+            result.append(float(p))
+        except ValueError:
+            # Could log a warning here to help detect bad .env entries
+            logger.warning("Invalid float value in CSV string: %r. Using fallback.", p)
+            return fallback
+
+    return result
+
 
 
 # ============================================================
@@ -83,24 +101,55 @@ class SmartExitManager:
     def __init__(self, binance_client):
         self.client = binance_client
 
+        # --- Always reload environment ---
         load_dotenv(override=True)
-        self.use_smart_exit = os.getenv("USE_SMART_EXIT", str(USE_SMART_EXIT)).lower() == "true"
-        self.atr_period = int(os.getenv("ATR_PERIOD", ATR_PERIOD))
-        self.atr_mult_tp = _parse_csv_floats(os.getenv("ATR_MULT_TP", ",".join(map(str, ATR_MULT_TP))), list(ATR_MULT_TP))
-        self.atr_mult_sl = safe_float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)), ATR_MULT_SL)
-        self.trailing_start_atr = safe_float(os.getenv("TRAILING_START_ATR", str(TRAILING_START_ATR)), TRAILING_START_ATR)
-        self.trailing_step_atr = safe_float(os.getenv("TRAILING_STEP_ATR", str(TRAILING_STEP_ATR)), TRAILING_STEP_ATR)
-        self.breakeven_atr = safe_float(os.getenv("BREAKEVEN_ATR", str(BREAKEVEN_ATR)), BREAKEVEN_ATR)
-        self.breakeven_buffer_pts = safe_float(os.getenv("BREAKEVEN_BUFFER_PTS", str(BREAKEVEN_BUFFER_PTS)), BREAKEVEN_BUFFER_PTS)
-        self.tp_partial_sizes = _parse_csv_floats(os.getenv("TP_PARTIAL_SIZES", ",".join(map(str, TP_PARTIAL_SIZES))), list(TP_PARTIAL_SIZES))
-        self.atr_partial_tps = _parse_csv_floats(os.getenv("ATR_PARTIAL_TPS", ",".join(map(str, ATR_PARTIAL_TPS))), list(ATR_PARTIAL_TPS))
 
-        logger.info(
-            "[SmartExit] Init config: use=%s atr_period=%s atr_mult_tp=%s atr_mult_sl=%s trail_start=%s trail_step=%s breakeven_atr=%s be_buf=%s",
-            self.use_smart_exit, self.atr_period, self.atr_mult_tp, self.atr_mult_sl,
-            self.trailing_start_atr, self.trailing_step_atr, self.breakeven_atr, self.breakeven_buffer_pts
+        # --- Configuration values ---
+        self.use_smart_exit = os.getenv("USE_SMART_EXIT", "true").lower() == "true"
+        self.atr_period = int(os.getenv("ATR_PERIOD", "14"))
+        self.atr_mult_tp = _parse_csv_floats(
+            os.getenv("ATR_MULT_TP", "2.461654,3.049415"),
+            [2.461654, 3.049415]
+        )
+        self.atr_mult_sl = safe_float(os.getenv("ATR_MULT_SL", "1.897911"), 1.897911)
+        self.trailing_start_atr = safe_float(os.getenv("TRAILING_START_ATR", "1.684771"), 1.684771)
+        self.trailing_step_atr = safe_float(os.getenv("TRAILING_STEP_ATR", "0.279722"), 0.279722)
+        self.breakeven_atr = safe_float(os.getenv("BREAKEVEN_ATR", "1.092215"), 1.092215)
+        self.breakeven_buffer_pts = safe_float(os.getenv("BREAKEVEN_BUFFER_PTS", "0.034933"), 0.034933)
+        self.tp_partial_sizes = _parse_csv_floats(
+            os.getenv("TP_PARTIAL_SIZES", "0.5,0.5"),
+            [0.5, 0.5]
         )
 
+        # --- Critical missing attribute ---
+        self.atr_partial_tps = _parse_csv_floats(
+            os.getenv("ATR_PARTIAL_TPS", "1.0,2.0,3.0"),  # default values
+            [1.0, 2.0, 3.0]
+        )
+
+        # --- Dry-run flag ---
+        env_dry = os.getenv("DRY_RUN")
+        if env_dry is not None:
+            self.dry_run = env_dry.lower() in ("1", "true", "yes")
+        else:
+            self.dry_run = bool(globals().get("DRY_RUN", False))
+
+        logger.info(
+            "[SmartExit] Init config: use=%s dry_run=%s atr_period=%s atr_mult_tp=%s atr_mult_sl=%s "
+            "trail_start=%s trail_step=%s breakeven_atr=%s be_buf=%s atr_partial_tps=%s",
+            self.use_smart_exit,
+            self.dry_run,
+            self.atr_period,
+            self.atr_mult_tp,
+            self.atr_mult_sl,
+            self.trailing_start_atr,
+            self.trailing_step_atr,
+            self.breakeven_atr,
+            self.breakeven_buffer_pts,
+            self.atr_partial_tps,
+        )
+
+        
     def round_to(self, value: Optional[float], step: Optional[float]) -> float:
         if value is None or not isinstance(value, (int, float)):
             return 0.0
@@ -425,6 +474,7 @@ class SmartExitManager:
     ):
         import math
         import logging
+        import os
 
         logger = logging.getLogger(__name__)
 
@@ -439,24 +489,81 @@ class SmartExitManager:
                 logger.warning(f"[SmartExit] Invalid quantity for {symbol}: {qty}")
                 return None
 
-            logger.info(
-                f"[SmartExit] Creating exit orders for {symbol} | side={side} | entry={entry_price:.2f} | ATR={atr:.4f} | qty={qty}"
+            # ------------------------------------------------------------------
+            # 🧩 UNIVERSAL DRY-RUN DETECTION (works for pytest + env + globals)
+            # ------------------------------------------------------------------
+            # 1️⃣  Instance-level override
+            inst_flag = getattr(self, "dry_run", None)
+
+            # 2️⃣  Environment variable (fresh read each call)
+            env_flag = os.environ.get("DRY_RUN")
+            if env_flag is not None:
+                env_flag = env_flag.lower() in ("1", "true", "yes")
+
+            # 3️⃣  Fallback to global config/module value
+            global_flag = globals().get("DRY_RUN", False)
+
+            # 4️⃣  Resolution priority: instance > env > global
+            dry_mode = (
+                inst_flag
+                if inst_flag is not None
+                else (env_flag if env_flag is not None else global_flag)
             )
 
-            # --- Dry-run mode ---
-            global_dry = globals().get("DRY_RUN", False)
-            instance_dry = getattr(self, "dry_run", None)
-            dry_mode = instance_dry if instance_dry is not None else global_dry
+            # Assign back to instance for reference
+            self.dry_run = bool(dry_mode)
+
+            logger.info(
+                f"[SmartExit] Creating exit orders for {symbol} | side={side} | "
+                f"entry={entry_price:.2f} | ATR={atr:.4f} | qty={qty} | dry_run={self.dry_run}"
+            )
+
+            # --- Early exit for DRY-RUN mode ---------------------------------
+            if self.dry_run:
+                TP_MULTS = getattr(self, "atr_mult_tp", [2.0, 3.0, 4.0])
+                SL_MULT = getattr(self, "atr_mult_sl", 1.5)
+
+                if side.upper() in ("LONG", "BUY"):
+                    tp_levels = [round(entry_price + atr * m, 5) for m in TP_MULTS]
+                    sl_price = round(entry_price - atr * SL_MULT, 5)
+                else:
+                    tp_levels = [round(entry_price - atr * m, 5) for m in TP_MULTS]
+                    sl_price = round(entry_price + atr * SL_MULT, 5)
+
+                logger.info(f"[SmartExit] DRY-RUN active: no live orders placed.")
+                for tp_price in tp_levels:
+                    logger.info(f"[SmartExit:DRYRUN] Simulated TP -> {symbol} @ {tp_price}")
+                logger.info(f"[SmartExit:DRYRUN] Simulated SL -> {symbol} @ {sl_price}")
+
+                return {
+                    "dry_run": True,
+                    "symbol": symbol,
+                    "side": side,
+                    "tp_levels": tp_levels,
+                    "sl_price": sl_price,
+                }
+
+            # ------------------------------------------------------------------
+            #  LIVE ORDER EXECUTION BELOW (only if DRY-RUN is False)
+            # ------------------------------------------------------------------
 
             # --- Symbol filters ---
             try:
                 if not tick_size or not step_size:
                     info = self.client.get_symbol_info(symbol)
                     filters = info.get("filters", [])
-                    tick_size = tick_size or next((float(f["tickSize"]) for f in filters if f["filterType"] == "PRICE_FILTER"), 0.1)
-                    step_size = step_size or next((float(f["stepSize"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001)
-                    min_qty = next((float(f["minQty"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001)
-                    min_notional = next((float(f.get("notional", 5.0)) for f in filters if f["filterType"] == "MIN_NOTIONAL"), 5.0)
+                    tick_size = tick_size or next(
+                        (float(f["tickSize"]) for f in filters if f["filterType"] == "PRICE_FILTER"), 0.1
+                    )
+                    step_size = step_size or next(
+                        (float(f["stepSize"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001
+                    )
+                    min_qty = next(
+                        (float(f["minQty"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001
+                    )
+                    min_notional = next(
+                        (float(f.get("notional", 5.0)) for f in filters if f["filterType"] == "MIN_NOTIONAL"), 5.0
+                    )
                 else:
                     min_qty, min_notional = 0.001, 5.0
             except Exception as e:
@@ -486,7 +593,7 @@ class SmartExitManager:
                     return snap_qty(q2)
                 return quantity
 
-            # --- Cancel existing exits ---
+            # --- Cancel existing exits first ---
             self.cancel_exit_orders_for_symbol(symbol)
 
             # --- Compute TP/SL levels ---
@@ -494,7 +601,6 @@ class SmartExitManager:
             SL_MULT = getattr(self, "atr_mult_sl", 1.5)
 
             if tp_levels is not None:
-                # ✅ SAFETY FIX: ensure tp_levels is iterable
                 if isinstance(tp_levels, (int, float)):
                     tp_levels = [tp_levels]
                 tp_levels = [snap_price(p) for p in tp_levels]
@@ -510,32 +616,17 @@ class SmartExitManager:
                     tp_levels = [snap_price(entry_price - atr * m) for m in TP_MULTS]
                     sl_price = snap_price(entry_price + atr * SL_MULT)
 
-            # --- Defensive filtering ---
             tp_levels = [float(x) for x in tp_levels if x and x > 0]
             if not tp_levels:
                 logger.warning(f"[SmartExit] No valid TP levels computed for {symbol}")
                 return None
 
-            # --- Partial qty allocation ---
+            # --- Partial quantity allocation ---
             tp_count = len(tp_levels)
             partial_qty = max(qty / tp_count, min_qty)
             partial_qtys = [snap_qty(valid_notional(tp, partial_qty)) for tp in tp_levels]
 
-            # --- Dry-run mode ---
-            if dry_mode:
-                for tp_price, tp_qty in zip(tp_levels, partial_qtys):
-                    logger.info(f"[SmartExit:DRYRUN] TP -> {symbol} SELL {tp_qty} @ {tp_price}")
-                logger.info(f"[SmartExit:DRYRUN] SL -> {symbol} STOP_MARKET @ {sl_price}")
-                return {
-                    "dry_run": True,
-                    "symbol": symbol,
-                    "side": side,
-                    "tp_levels": tp_levels,
-                    "partial_qtys": partial_qtys,
-                    "sl_price": sl_price,
-                }
-
-            # --- Live TP orders ---
+            # --- Live order placement ---
             tp_orders = []
             for tp_price, tp_qty in zip(tp_levels, partial_qtys):
                 payload = dict(
@@ -582,8 +673,6 @@ class SmartExitManager:
         except Exception as e:
             logger.exception(f"[SmartExit:FATAL] Unexpected error in create_exit_orders: {e}")
             return None
-
-
 
 
 
