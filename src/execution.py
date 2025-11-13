@@ -310,37 +310,21 @@ class ExecutionManager:
 
         logger = logging.getLogger(__name__)
 
+        # ----------------------------------------------------------------------
+        # ✅ Helpers
+        # ----------------------------------------------------------------------
         def _safe_parse_tp_mults(raw) -> List[float]:
-            """Accept str/float/int/list and return list[float] fallbacking to defaults on error."""
             defaults = [2.0, 3.0, 4.0]
             try:
                 if raw is None:
                     return defaults
-                # If environment loader already returned a list/tuple
                 if isinstance(raw, (list, tuple)):
-                    out = []
-                    for v in raw:
-                        try:
-                            out.append(float(v))
-                        except Exception:
-                            continue
-                    return out or defaults
-                # numeric already
+                    return [float(v) for v in raw if v is not None]
                 if isinstance(raw, (int, float)):
                     return [float(raw)]
-                # string
                 if isinstance(raw, str):
-                    raw_s = raw.strip()
-                    if not raw_s:
-                        return defaults
-                    parts = [p.strip() for p in raw_s.split(",") if p.strip()]
-                    out = []
-                    for p in parts:
-                        try:
-                            out.append(float(p))
-                        except Exception:
-                            continue
-                    return out or defaults
+                    parts = [p.strip() for p in raw.split(",") if p.strip()]
+                    return [float(p) for p in parts] or defaults
             except Exception:
                 pass
             return defaults
@@ -353,56 +337,61 @@ class ExecutionManager:
 
         def _extract_usdt_balance(balances_resp: Any) -> float:
             """
-            Safely extract USDT balance from many shapes:
-            - list of dicts [{'asset':'USDT','balance':'123'}, ...]
-            - dict wrapping a list {'balances': [...]}
-            - single dict {'asset':'USDT','balance':'123'}
-            - dict mapping {'USDT': '123'}
-            - numeric or string numeric
+            Safely extract numeric USDT balance from Binance futures_account_balance()
+            regardless of shape (list, dict, or nested).
             """
             try:
-                # list-like of dicts
+                # Case 1: list or tuple of dicts
                 if isinstance(balances_resp, (list, tuple)):
                     for b in balances_resp:
-                        if not isinstance(b, dict):
-                            continue
-                        asset = str(b.get("asset", b.get("currency", "") or "")).upper()
-                        if asset == "USDT":
-                            return safe_float(b.get("balance") or b.get("free") or b.get("walletBalance") or 0.0, 0.0)
+                        if isinstance(b, dict):
+                            asset = str(b.get("asset", b.get("currency", ""))).upper()
+                            if asset == "USDT":
+                                val = b.get("balance") or b.get("free") or b.get("walletBalance") or 0.0
+                                return float(val)
                     return 0.0
 
-                # dict wrappers
+                # Case 2: dict responses
                 if isinstance(balances_resp, dict):
-                    # direct mapping 'USDT': '123'
-                    if "USDT" in balances_resp:
-                        return safe_float(balances_resp.get("USDT"), 0.0)
-                    # common wrapper keys
+                    # Direct mapping like {"USDT": "123.45"}
+                    if "USDT" in balances_resp and isinstance(balances_resp["USDT"], (int, float, str)):
+                        return float(balances_resp["USDT"])
+
+                    # Wrapped responses like {"balances": [...]} or {"data": [...]}
                     for key in ("balances", "assets", "accountBalances", "data"):
                         inner = balances_resp.get(key)
                         if isinstance(inner, (list, tuple)):
                             return _extract_usdt_balance(inner)
-                    # single dict with asset + balance
-                    if "asset" in balances_resp and str(balances_resp.get("asset", "")).upper() == "USDT":
-                        return safe_float(balances_resp.get("balance") or balances_resp.get("free") or 0.0, 0.0)
-                    # sometimes balance number in dict under other keys
-                    for k, v in balances_resp.items():
-                        if isinstance(k, str) and k.upper() == "USDT":
-                            return safe_float(v, 0.0)
+
+                    # Single-asset dict: {"asset": "USDT", "balance": "123.45"}
+                    if str(balances_resp.get("asset", "")).upper() == "USDT":
+                        val = balances_resp.get("balance") or balances_resp.get("free") or 0.0
+                        return float(val)
+
                     return 0.0
 
-                # numeric or numeric-string
-                return safe_float(balances_resp, 0.0)
+                # Case 3: Plain numeric or string numeric
+                if isinstance(balances_resp, (int, float, str)):
+                    try:
+                        return float(balances_resp)
+                    except Exception:
+                        return 0.0
+
+                return 0.0
             except Exception:
                 return 0.0
 
+        # ----------------------------------------------------------------------
+        # ✅ Main Execution
+        # ----------------------------------------------------------------------
         try:
-            # --- 1️⃣ Load environment ---
+            # 1️⃣ Load .env
             try:
                 load_dotenv(override=True)
             except Exception:
                 pass
 
-            # --- 2️⃣ Sync server time ---
+            # 2️⃣ Sync server time
             try:
                 server_time = self.client.futures_time()
                 if isinstance(server_time, dict) and "serverTime" in server_time:
@@ -411,21 +400,20 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Server time sync failed: %s", e)
 
-            # --- 3️⃣ ATR multipliers ---
+            # 3️⃣ Parse ATR multipliers
             raw_tp = os.getenv("ATR_MULT_TP", "2.0,3.0,4.0")
             tp_mults = _safe_parse_tp_mults(raw_tp)
-
             raw_sl = os.getenv("ATR_MULT_SL", "1.5")
             sl_mult = _safe_parse_float(raw_sl, 1.5)
 
-            # --- 4️⃣ Current price ---
+            # 4️⃣ Current price
             price_data = self.client.ticker_price(symbol)
             price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
             if not price or price <= 0:
                 logger.warning(f"⚠️ Invalid price for {symbol}: {price}")
                 return None
 
-            # --- 5️⃣ Symbol filters ---
+            # 5️⃣ Symbol filters
             tick, step, min_qty, min_notional = 0.0, 0.0, None, None
             try:
                 info = self.client.get_symbol_info(symbol) or {}
@@ -435,14 +423,13 @@ class ExecutionManager:
                         tick = float(f.get("tickSize", tick))
                     elif t == "LOT_SIZE":
                         step = float(f.get("stepSize", step))
-                        if f.get("minQty") is not None:
-                            min_qty = float(f.get("minQty"))
+                        min_qty = float(f.get("minQty", min_qty or 0))
                     elif t in ("MIN_NOTIONAL", "NOTIONAL"):
                         min_notional = float(f.get("minNotional", f.get("notional", min_notional or 0)))
             except Exception as e:
                 logger.debug("Filter fetch failed for %s: %s", symbol, e)
 
-            # --- 6️⃣ ATR fallback ---
+            # 6️⃣ ATR fallback (15m, 30 samples)
             atr = None
             try:
                 klines = self.client.get_klines(symbol, "15m", 30) or []
@@ -458,7 +445,7 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("ATR fetch failed: %s", e)
 
-            # --- 7️⃣ Compute TP & SL ---
+            # 7️⃣ Compute TP & SL
             is_long = direction.upper() in ("LONG", "BUY")
             if atr and atr > 0:
                 tp_levels = [price + atr * m if is_long else price - atr * m for m in tp_mults]
@@ -469,36 +456,36 @@ class ExecutionManager:
             tp_levels = [self._round_to(tp, tick) for tp in tp_levels]
             sl = self._round_to(sl, tick)
 
-            # --- 8️⃣ Adaptive margin & dynamic qty ---
-            balances = None
+            # 8️⃣ Compute margin & qty
             try:
                 balances = self.client.futures_account_balance()
             except Exception as e:
-                logger.debug("futures_account_balance() call failed: %s", e)
+                logger.debug("futures_account_balance() failed: %s", e)
                 balances = None
 
             usdt_balance = _extract_usdt_balance(balances)
             margin_percent = float(os.getenv("MARGIN_PERCENT", "0.1"))
-            margin_usdt = usdt_balance * margin_percent
             leverage = int(os.getenv("LEVERAGE", "10"))
+            margin_usdt = usdt_balance * margin_percent
 
             try:
                 mark_price = float(self.client.ticker_price(symbol=symbol)["price"])
                 qty = max(round((margin_usdt * leverage) / mark_price, 3), 0.001)
                 qty = self._round_to(qty, step)
-                if qty <= 0:
-                    logger.warning("Invalid qty computed for %s", symbol)
-                    return None
             except Exception as e:
-                logger.error(f"Failed to compute dynamic quantity: {e}")
+                logger.error(f"Failed to compute dynamic qty: {e}")
                 return None
 
-            # --- 9️⃣ Dry-run ---
+            # 9️⃣ Dry-run
             if self.dry_run:
                 pos = {
-                    "symbol": symbol, "side": direction,
-                    "entry": price, "qty": qty,
-                    "tp_levels": tp_levels, "sl": sl, "atr": atr,
+                    "symbol": symbol,
+                    "side": direction,
+                    "entry": price,
+                    "qty": qty,
+                    "tp_levels": tp_levels,
+                    "sl": sl,
+                    "atr": atr,
                     "timestamp": datetime.utcnow().isoformat(),
                     "status": "DRY_RUN"
                 }
@@ -506,7 +493,7 @@ class ExecutionManager:
                 logger.info("🧪 DRY-RUN: %s %s", direction, symbol)
                 return pos
 
-            # --- 🔟 MarketIntegrityGuard ---
+            # 🔟 MarketIntegrityGuard
             orderbook = self._fetch_orderbook(symbol)
             trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, trades, events_per_sec=0.0)
@@ -526,26 +513,26 @@ class ExecutionManager:
                 self.open_positions[symbol] = pending
                 return pending
 
-            # --- 1️⃣1️⃣ Set leverage ---
+            # 1️⃣1️⃣ Set leverage
             try:
                 if hasattr(self.client, "futures_change_leverage"):
                     self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             except Exception as le:
                 logger.debug("Leverage set failed: %s", le)
 
-            # --- 1️⃣2️⃣ Validation ---
-            if min_qty is not None and qty < float(min_qty):
+            # 1️⃣2️⃣ Validation
+            if min_qty and qty < float(min_qty):
                 failure = {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"qty<{min_qty}"}
                 self.open_positions[symbol] = failure
-                logger.error("Quantity validation failed for %s: qty=%s minQty=%s", symbol, qty, min_qty)
+                logger.error("Qty validation failed for %s: %s < %s", symbol, qty, min_qty)
                 return failure
-            if min_notional is not None and qty * price < float(min_notional):
+            if min_notional and qty * price < float(min_notional):
                 failure = {"symbol": symbol, "status": "FAILED_VALIDATION", "error": "below minNotional"}
                 self.open_positions[symbol] = failure
-                logger.error("Notional validation failed for %s: notional=%.8f minNotional=%s", symbol, qty * price, min_notional)
+                logger.error("Notional validation failed for %s: %.8f < %s", symbol, qty * price, min_notional)
                 return failure
 
-            # --- 1️⃣3️⃣ Place Market Order ---
+            # 1️⃣3️⃣ Place Market Order
             try:
                 order_result = self.client.futures_create_order(
                     symbol=symbol,
@@ -556,25 +543,13 @@ class ExecutionManager:
                 logger.info("✅ Opened %s %s @%.2f qty=%.8f", direction, symbol, price, qty)
             except Exception as e:
                 logger.exception("❌ Market order failed for %s: %s", symbol, e)
-                pending = {
-                    "symbol": symbol,
-                    "side": direction,
-                    "entry": price,
-                    "qty": qty,
-                    "tp_levels": tp_levels,
-                    "sl": sl,
-                    "atr": atr,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "status": "PENDING_ORDER_FAILED",
-                    "error": str(e),
-                }
-                self.open_positions[symbol] = pending
-                return pending
+                return {"symbol": symbol, "status": "PENDING_ORDER_FAILED", "error": str(e)}
 
-            # --- 1️⃣4️⃣ SmartExit integration ---
+            # 1️⃣4️⃣ SmartExit Integration (patched)
             smartexit_err = None
             if USE_SMART_EXIT:
                 try:
+                    time.sleep(0.6)  # wait for Binance to register position
                     self.smart_exit.create_exit_orders(
                         symbol=symbol,
                         side=direction,
@@ -587,9 +562,9 @@ class ExecutionManager:
                     )
                 except Exception as e:
                     smartexit_err = str(e)
-                    logger.exception("SmartExit.create_exit_orders failed for %s", symbol)
+                    logger.exception("SmartExit.create_exit_orders failed for %s: %s", symbol, e)
 
-            # --- 1️⃣5️⃣ Track opened position ---
+            # 1️⃣5️⃣ Track opened position
             tracked = {
                 "symbol": symbol,
                 "side": direction,
@@ -608,15 +583,7 @@ class ExecutionManager:
 
         except Exception as e:
             logger.exception("Unhandled open_position error for %s: %s", symbol, e)
-            failure = {
-                "symbol": symbol,
-                "status": "FAILED_UNHANDLED",
-                "error": str(e),
-                "error_detail": repr(e),
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            self.open_positions[symbol] = failure
-            return failure
+            return {"symbol": symbol, "status": "FAILED_UNHANDLED", "error": str(e)}
 
 
 
