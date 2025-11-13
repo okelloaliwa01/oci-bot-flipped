@@ -475,11 +475,114 @@ class SmartExitManager:
         import math
         import logging
         import os
+        import time
 
         logger = logging.getLogger(__name__)
 
+        # --- helpers -------------------------------------------------------
+        def _resolve_dry_run():
+            inst_flag = getattr(self, "dry_run", None)
+            env_flag = os.environ.get("DRY_RUN")
+            if env_flag is not None:
+                env_flag = env_flag.lower() in ("1", "true", "yes")
+            global_flag = globals().get("DRY_RUN", False)
+            resolved = inst_flag if inst_flag is not None else (env_flag if env_flag is not None else global_flag)
+            self.dry_run = bool(resolved)
+            return self.dry_run
+
+        def _snap_price(p, tick):
+            if not tick or tick <= 0:
+                return float(p)
+            # avoid float precision issues: snap using integer math
+            decimals = max(0, int(round(-math.log10(tick))))
+            snapped = round(round(p / tick) * tick, decimals)
+            return float(snapped)
+
+        def _snap_qty(q, step, min_qty):
+            q = max(q, min_qty or 0)
+            if not step or step <= 0:
+                return float(q)
+            decimals = max(0, int(round(-math.log10(step))))
+            snapped = round(round(q / step) * step, decimals)
+            # ensure at least min_qty
+            if min_qty and snapped < min_qty:
+                return float(min_qty)
+            return float(snapped)
+
+        def _position_confirmed(client, sym, side_expected, timeout=5.0, poll_interval=0.5):
+            """
+            Wait until the exchange reports an open position for the symbol matching side_expected.
+            side_expected: "LONG" or "SHORT"
+            """
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    # prefer get_position which returns dict for a symbol
+                    pos = {}
+                    if hasattr(client, "get_position"):
+                        pos = client.get_position(sym) or {}
+                    else:
+                        # fallback to get_position_risk list
+                        if hasattr(client, "get_position_risk"):
+                            for p in client.get_position_risk(sym) or []:
+                                if p.get("symbol") == sym:
+                                    pos = p
+                                    break
+                    amt = 0.0
+                    if isinstance(pos, dict):
+                        amt = float(pos.get("positionAmt") or pos.get("position") or pos.get("quantity") or 0.0)
+                    if side_expected.upper() in ("SHORT", "SELL") and amt < 0:
+                        return True
+                    if side_expected.upper() in ("LONG", "BUY") and amt > 0:
+                        return True
+                except Exception:
+                    # ignore transient errors while polling
+                    pass
+                time.sleep(poll_interval)
+            return False
+
+        def _place_order_with_reduce_retry(payload, confirm_position_after=False):
+            """
+            Place an order with targeted retry behavior for ReduceOnly rejections.
+            Returns order on success or raises last exception on failure.
+            """
+            # attempt direct call variants; treat reduce-only rejection specially
+            MAX_RETRIES = 3
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    order = self.client.futures_create_order(**payload)
+                    return order
+                except Exception as e:
+                    # try to detect Binance -2022 reduceOnly rejection
+                    estr = str(e).lower()
+                    if ("-2022" in estr) or ("reduceonly order is rejected" in estr) or ("reduceonly" in estr and "rejected" in estr):
+                        logger.warning("[SmartExit] ReduceOnly rejected for %s @ %s (attempt %d/%d). Will retry after position confirmation.",
+                                    payload.get("symbol"), payload.get("price"), attempt, MAX_RETRIES)
+                        # If we haven't confirmed the position, wait a bit and re-confirm
+                        if not _position_confirmed(self.client, payload.get("symbol"), side, timeout=2.5, poll_interval=0.5):
+                            # small wait before retry
+                            time.sleep(0.6)
+                            continue
+                        else:
+                            # position is confirmed yet reduceonly still rejected -> don't retry infinitely
+                            logger.warning("[SmartExit] Position reported but reduceOnly still rejected for %s; aborting this TP.", payload.get("symbol"))
+                            raise
+                    else:
+                        # transient/other errors: backoff and retry a couple of times
+                        if attempt < MAX_RETRIES:
+                            backoff = 0.5 * attempt
+                            logger.debug("[SmartExit] Order attempt %d failed, retrying in %.2fs: %s", attempt, backoff, e)
+                            time.sleep(backoff)
+                            continue
+                        else:
+                            logger.error("[SmartExit] Order attempt %d failed (final): %s", attempt, e)
+                            raise
+            raise RuntimeError("Unreachable _place_order_with_reduce_retry exit")
+
+        # ------------------------------------------------------------------
+
         try:
-            # --- ATR validation ---
+            # Validate ATR / qty
             atr = atr_value or atr
             if atr is None or atr <= 0:
                 logger.warning(f"[SmartExit] Missing or invalid ATR value for {symbol}. atr={atr}")
@@ -489,121 +592,65 @@ class SmartExitManager:
                 logger.warning(f"[SmartExit] Invalid quantity for {symbol}: {qty}")
                 return None
 
-            # ------------------------------------------------------------------
-            # 🧩 UNIVERSAL DRY-RUN DETECTION (works for pytest + env + globals)
-            # ------------------------------------------------------------------
-            # 1️⃣  Instance-level override
-            inst_flag = getattr(self, "dry_run", None)
+            dry = _resolve_dry_run()
+            logger.info("[SmartExit] Creating exit orders for %s | side=%s | entry=%.2f | ATR=%.4f | qty=%.6f | dry_run=%s",
+                        symbol, side, entry_price, atr, qty, dry)
 
-            # 2️⃣  Environment variable (fresh read each call)
-            env_flag = os.environ.get("DRY_RUN")
-            if env_flag is not None:
-                env_flag = env_flag.lower() in ("1", "true", "yes")
-
-            # 3️⃣  Fallback to global config/module value
-            global_flag = globals().get("DRY_RUN", False)
-
-            # 4️⃣  Resolution priority: instance > env > global
-            dry_mode = (
-                inst_flag
-                if inst_flag is not None
-                else (env_flag if env_flag is not None else global_flag)
-            )
-
-            # Assign back to instance for reference
-            self.dry_run = bool(dry_mode)
-
-            logger.info(
-                f"[SmartExit] Creating exit orders for {symbol} | side={side} | "
-                f"entry={entry_price:.2f} | ATR={atr:.4f} | qty={qty} | dry_run={self.dry_run}"
-            )
-
-            # --- Early exit for DRY-RUN mode ---------------------------------
-            if self.dry_run:
+            # --- DRY-RUN early return (simulate levels) -----------------------
+            if dry:
                 TP_MULTS = getattr(self, "atr_mult_tp", [2.0, 3.0, 4.0])
                 SL_MULT = getattr(self, "atr_mult_sl", 1.5)
-
                 if side.upper() in ("LONG", "BUY"):
-                    tp_levels = [round(entry_price + atr * m, 5) for m in TP_MULTS]
-                    sl_price = round(entry_price - atr * SL_MULT, 5)
+                    tps = [entry_price + atr * m for m in TP_MULTS]
+                    sl_price = entry_price - atr * SL_MULT
                 else:
-                    tp_levels = [round(entry_price - atr * m, 5) for m in TP_MULTS]
-                    sl_price = round(entry_price + atr * SL_MULT, 5)
+                    tps = [entry_price - atr * m for m in TP_MULTS]
+                    sl_price = entry_price + atr * SL_MULT
+                tps = [float(round(x, 6)) for x in tps]
+                sl_price = float(round(sl_price, 6))
+                logger.info("[SmartExit] DRY-RUN active; simulated TP levels: %s | SL: %s", tps, sl_price)
+                return {"dry_run": True, "symbol": symbol, "side": side, "tp_levels": tps, "sl_price": sl_price}
 
-                logger.info(f"[SmartExit] DRY-RUN active: no live orders placed.")
-                for tp_price in tp_levels:
-                    logger.info(f"[SmartExit:DRYRUN] Simulated TP -> {symbol} @ {tp_price}")
-                logger.info(f"[SmartExit:DRYRUN] Simulated SL -> {symbol} @ {sl_price}")
-
-                return {
-                    "dry_run": True,
-                    "symbol": symbol,
-                    "side": side,
-                    "tp_levels": tp_levels,
-                    "sl_price": sl_price,
-                }
-
-            # ------------------------------------------------------------------
-            #  LIVE ORDER EXECUTION BELOW (only if DRY-RUN is False)
-            # ------------------------------------------------------------------
-
-            # --- Symbol filters ---
+            # --- Fetch symbol filters (price/qty precision + min_notional) -----
             try:
-                if not tick_size or not step_size:
-                    info = self.client.get_symbol_info(symbol)
-                    filters = info.get("filters", [])
-                    tick_size = tick_size or next(
-                        (float(f["tickSize"]) for f in filters if f["filterType"] == "PRICE_FILTER"), 0.1
-                    )
-                    step_size = step_size or next(
-                        (float(f["stepSize"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001
-                    )
-                    min_qty = next(
-                        (float(f["minQty"]) for f in filters if f["filterType"] == "LOT_SIZE"), 0.001
-                    )
-                    min_notional = next(
-                        (float(f.get("notional", 5.0)) for f in filters if f["filterType"] == "MIN_NOTIONAL"), 5.0
-                    )
-                else:
-                    min_qty, min_notional = 0.001, 5.0
+                info = self.client.get_symbol_info(symbol) or {}
+                filters = info.get("filters", [])
+                tick_size = tick_size or next((float(f["tickSize"]) for f in filters if f.get("filterType") == "PRICE_FILTER"), 0.1)
+                step_size = step_size or next((float(f["stepSize"]) for f in filters if f.get("filterType") == "LOT_SIZE"), 0.0001)
+                min_qty = next((float(f.get("minQty", 0.0)) for f in filters if f.get("filterType") == "LOT_SIZE"), 0.0001)
+                min_notional = next((float(f.get("minNotional") or f.get("notional") or 0.0) for f in filters if f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL")), 0.0)
+                if not min_notional:
+                    min_notional = 1.0  # sensible default if not provided
             except Exception as e:
-                logger.warning(f"[SmartExit] Could not fetch symbol filters for {symbol}: {e}")
-                tick_size, step_size, min_qty, min_notional = 0.1, 0.001, 0.001, 5.0
+                logger.warning("[SmartExit] Could not fetch symbol filters for %s: %s. Using defaults.", symbol, e)
+                tick_size, step_size, min_qty, min_notional = 0.1, 0.0001, 0.0001, 1.0
 
-            # --- Precision helpers ---
-            def snap_price(p):
-                if not tick_size or tick_size <= 0:
-                    return float(p)
-                decimals = max(0, int(abs(math.log10(tick_size))))
-                return round(round(p / tick_size) * tick_size, decimals)
+            # --- Snap helpers bound to resolved precision ----------------------
+            snap_price = lambda p: _snap_price(p, tick_size)
+            snap_qty = lambda q: _snap_qty(q, step_size, min_qty)
+            def enforce_min_notional(price, q):
+                if price * q < min_notional:
+                    needed_q = min_notional / price
+                    logger.warning("[SmartExit:FIX] %s: notional (%.6f) < min_notional(%.2f). Adjusting qty -> %.6f",
+                                symbol, price * q, min_notional, needed_q)
+                    return snap_qty(needed_q)
+                return q
 
-            def snap_qty(q):
-                q = max(q, min_qty)
-                if not step_size or step_size <= 0:
-                    return q
-                decimals = max(0, int(abs(math.log10(step_size))))
-                return round(round(q / step_size) * step_size, decimals)
+            # --- Cancel any existing SmartExit orders for symbol ----------------
+            try:
+                if hasattr(self, "cancel_exit_orders_for_symbol"):
+                    self.cancel_exit_orders_for_symbol(symbol)
+            except Exception as e:
+                logger.debug("[SmartExit] cancel_exit_orders_for_symbol failed: %s", e)
 
-            def valid_notional(price, quantity):
-                if price * quantity < min_notional:
-                    q2 = min_notional / price
-                    logger.warning(
-                        f"[SmartExit:FIX] Adjusting qty for minNotional ({price*quantity:.4f}<{min_notional}) -> {q2:.6f}"
-                    )
-                    return snap_qty(q2)
-                return quantity
-
-            # --- Cancel existing exits first ---
-            self.cancel_exit_orders_for_symbol(symbol)
-
-            # --- Compute TP/SL levels ---
+            # --- Compute TP and SL levels -------------------------------------
             TP_MULTS = getattr(self, "atr_mult_tp", [2.0, 3.0, 4.0])
             SL_MULT = getattr(self, "atr_mult_sl", 1.5)
 
             if tp_levels is not None:
                 if isinstance(tp_levels, (int, float)):
-                    tp_levels = [tp_levels]
-                tp_levels = [snap_price(p) for p in tp_levels]
+                    tp_levels = [float(tp_levels)]
+                tp_levels = [snap_price(float(p)) for p in tp_levels if p is not None]
                 if side.upper() in ("LONG", "BUY"):
                     sl_price = snap_price(entry_price - atr * SL_MULT)
                 else:
@@ -618,47 +665,86 @@ class SmartExitManager:
 
             tp_levels = [float(x) for x in tp_levels if x and x > 0]
             if not tp_levels:
-                logger.warning(f"[SmartExit] No valid TP levels computed for {symbol}")
+                logger.warning("[SmartExit] No valid TP levels computed for %s", symbol)
                 return None
 
-            # --- Partial quantity allocation ---
+            # --- Compute per-TP partial quantities (respect min_qty & min_notional) ---
             tp_count = len(tp_levels)
-            partial_qty = max(qty / tp_count, min_qty)
-            partial_qtys = [snap_qty(valid_notional(tp, partial_qty)) for tp in tp_levels]
+            base_partial_qty = max(qty / tp_count, min_qty)
+            partial_qtys = []
+            for tp_price in tp_levels:
+                q0 = base_partial_qty
+                q1 = enforce_min_notional(tp_price, q0)
+                q2 = snap_qty(q1)
+                partial_qtys.append(q2)
 
-            # --- Live order placement ---
+            # --- Confirm position exists before placing reduceOnly TP orders ---
+            # Determine expected side for position: SHORT => negative position (we sold), LONG => positive
+            expected_side = "SHORT" if side.upper() in ("SHORT", "SELL") else "LONG"
+            confirmed = _position_confirmed(self.client, symbol, expected_side, timeout=5.0, poll_interval=0.5)
+            if not confirmed:
+                logger.warning("[SmartExit] Position for %s not visible yet. Waiting briefly then trying to place reduceOnly TPs.", symbol)
+                # extra short wait then re-check
+                time.sleep(0.7)
+                confirmed = _position_confirmed(self.client, symbol, expected_side, timeout=3.0, poll_interval=0.5)
+
+            # --- Place TP orders (reduceOnly only if position confirmed) -------
             tp_orders = []
+            placed_tp_errors = []
             for tp_price, tp_qty in zip(tp_levels, partial_qtys):
-                payload = dict(
-                    symbol=symbol,
-                    side="SELL" if side.upper() in ("LONG", "BUY") else "BUY",
-                    type="LIMIT",
-                    price=str(tp_price),
-                    quantity=tp_qty,
-                    reduceOnly=True,
-                    timeInForce="GTC",
-                )
-                try:
-                    order = self.client.futures_create_order(**payload)
-                    tp_orders.append(order)
-                    logger.info(f"[SmartExit] TP placed -> {symbol} {payload['side']} {tp_qty} @ {tp_price}")
-                except Exception as e:
-                    logger.error(f"[SmartExit] TP failed for {symbol} @ {tp_price}: {e}")
+                side_tp = "SELL" if expected_side == "LONG" else "BUY"
+                # only add reduceOnly if position confirmed; otherwise attempt without reduceOnly once (safer fallback)
+                reduce_only_flag = bool(confirmed)
+                payload = {
+                    "symbol": symbol,
+                    "side": side_tp,
+                    "type": "LIMIT",
+                    "price": str(tp_price),
+                    "quantity": tp_qty,
+                    "timeInForce": "GTC",
+                    # do not include reduceOnly key when False for some SDK versions; include only when needed
+                }
+                if reduce_only_flag:
+                    payload["reduceOnly"] = True
 
-            # --- Live SL order ---
+                try:
+                    order = _place_order_with_reduce_retry(payload, confirm_position_after=confirmed)
+                    tp_orders.append(order)
+                    logger.info("[SmartExit] TP placed -> %s %s %s @ %s", symbol, payload["side"], tp_qty, tp_price)
+                except Exception as e:
+                    # If reduceOnly was True and refused, try once without reduceOnly (best-effort fallback)
+                    estr = str(e).lower()
+                    placed_tp_errors.append({"price": tp_price, "qty": tp_qty, "error": str(e)})
+                    logger.error("[SmartExit] TP failed for %s @ %s: %s", symbol, tp_price, e)
+                    if reduce_only_flag:
+                        # fallback attempt without reduceOnly (only one attempt)
+                        try:
+                            payload.pop("reduceOnly", None)
+                            order = self.client.futures_create_order(**payload)
+                            tp_orders.append(order)
+                            logger.info("[SmartExit] TP placed (without reduceOnly fallback) -> %s %s %s @ %s", symbol, payload["side"], tp_qty, tp_price)
+                        except Exception as e2:
+                            logger.error("[SmartExit] Fallback TP (no reduceOnly) also failed for %s @ %s: %s", symbol, tp_price, e2)
+                            placed_tp_errors.append({"price": tp_price, "qty": tp_qty, "error_fallback": str(e2)})
+
+            # --- Place SL (STOP_MARKET) using closePosition=True or closePosition flag per SDK
             try:
-                payload = dict(
-                    symbol=symbol,
-                    side="SELL" if side.upper() in ("LONG", "BUY") else "BUY",
-                    type="STOP_MARKET",
-                    stopPrice=str(sl_price),
-                    closePosition=True,
-                    timeInForce="GTC",
-                )
-                self.client.futures_create_order(**payload)
-                logger.info(f"[SmartExit] SL placed -> {symbol} @ {sl_price}")
+                sl_side = "SELL" if expected_side == "LONG" else "BUY"
+                sl_payload = {
+                    "symbol": symbol,
+                    "side": sl_side,
+                    "type": "STOP_MARKET",
+                    "stopPrice": str(sl_price),
+                    "closePosition": True,
+                    "timeInForce": "GTC",
+                }
+                # some SDKs prefer reduceOnly vs closePosition; include both (exchange ignores unsupported)
+                sl_payload["reduceOnly"] = True
+                sl_order = self.client.futures_create_order(**sl_payload)
+                logger.info("[SmartExit] SL placed -> %s @ %s", symbol, sl_price)
             except Exception as e:
-                logger.error(f"[SmartExit] SL failed for {symbol} @ {sl_price}: {e}")
+                logger.error("[SmartExit] SL failed for %s @ %s: %s", symbol, sl_price, e)
+                sl_order = None
 
             return {
                 "dry_run": False,
@@ -668,11 +754,15 @@ class SmartExitManager:
                 "partial_qtys": partial_qtys,
                 "sl_price": sl_price,
                 "tp_orders": tp_orders,
+                "sl_order": sl_order,
+                "tp_errors": placed_tp_errors,
+                "position_confirmed": bool(confirmed),
             }
 
         except Exception as e:
-            logger.exception(f"[SmartExit:FATAL] Unexpected error in create_exit_orders: {e}")
+            logger.exception("[SmartExit:FATAL] Unexpected error in create_exit_orders: %s", e)
             return None
+
 
 
 
