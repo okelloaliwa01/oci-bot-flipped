@@ -9,42 +9,74 @@ from config import (
 )
 
 # ----------------------------------------------------------------------
-# ✅ Utility EMA calculator (fallback if ta-lib not installed)
+# Utility EMA calculator (fallback if ta-lib not installed)
 # ----------------------------------------------------------------------
 def ema(series: pd.Series, window: int):
-    """Compute EMA using pandas built-in ewm to avoid extra dependencies."""
+    """Compute EMA using pandas' built-in ewm to avoid extra dependencies."""
     return series.ewm(span=window, adjust=False).mean()
 
 
 # ----------------------------------------------------------------------
-# ✅ Breakout Detection Logic (with anti-fakeout integration)
+# Internal helper utilities (clean + testable)
 # ----------------------------------------------------------------------
-def check_breakout(df_last21: pd.DataFrame,
-                   volume_multiplier: float = 1.5,
-                   min_body_ratio: float = 0.6,
-                   atr_window: int = 14,
-                   atr_multiplier: float = 0.8,
-                   confirm_retest: bool = True):
+def candle_body_ratio(open_price: float, close_price: float, high: float, low: float) -> float:
+    """Return candle body size as ratio of full range."""
+    candle_range = high - low
+    if candle_range <= 0:
+        return 0.0
+    return abs(close_price - open_price) / candle_range
+
+
+def average_volume(prev: pd.DataFrame) -> float:
+    """Returns average volume of previous candles."""
+    return prev["volume"].mean() if "volume" in prev and not prev.empty else 0
+
+
+def compute_atr_like(prev: pd.DataFrame, window: int) -> float:
+    """Compute simplified ATR-like average true range."""
+    high_low = prev['high'] - prev['low']
+    return (
+        high_low.rolling(window=window).mean().iloc[-1]
+        if len(high_low) >= window else high_low.mean()
+    )
+
+
+def debug_log(msg: str):
+    """Unified debug logging."""
+    print(f"[DEBUG BREAKOUT] {msg}")
+
+
+# ----------------------------------------------------------------------
+# Breakout Detection Logic (with anti-fakeout integration)
+# ----------------------------------------------------------------------
+def check_breakout(
+    df_last21: pd.DataFrame,
+    volume_multiplier: float = 1.5,
+    min_body_ratio: float = 0.6,
+    atr_window: int = 14,
+    atr_multiplier: float = 0.8,
+    confirm_retest: bool = True
+):
     """
-    Robust breakout detection that integrates dynamic anti-fakeout filters.
-    Inputs:
-      df_last21: DataFrame of 21 candles (oldest -> newest). Columns required:
-                 ['open', 'high', 'low', 'close', 'volume']
+    Robust breakout detection integrating dynamic anti-fakeout filters.
+
     Returns:
-      (signal, level, context)
-      signal ∈ {"LONG", "SHORT", "PENDING_CONFIRM", None}
-      level: breakout level (resistance/support)
-      context: dict with metadata (trend, vol_ok, body_ratio, atr, etc.)
+        (signal, level, context)
+        signal ∈ {"LONG", "SHORT", "PENDING_CONFIRM", None}
     """
 
+    # Validate input
     if df_last21 is None or df_last21.shape[0] < 21:
         return None, None, {}
 
     breakout = df_last21.iloc[-1]
     prev = df_last21.iloc[:-1].copy()
 
+    close_price = breakout["close"]
+    open_price = breakout["open"]
+
     # ------------------------------------------------------------------
-    # Key levels (support & resistance)
+    # Key levels
     # ------------------------------------------------------------------
     resistance = prev['high'].max()
     support = prev['low'].min()
@@ -52,28 +84,20 @@ def check_breakout(df_last21: pd.DataFrame,
     # ------------------------------------------------------------------
     # Volume confirmation
     # ------------------------------------------------------------------
-    avg_vol = prev['volume'].mean()
-    vol_ok = breakout['volume'] >= volume_multiplier * avg_vol if avg_vol > 0 else False
+    avg_vol = average_volume(prev)
+    vol_ok = close_price >= 0 and breakout['volume'] >= volume_multiplier * avg_vol if avg_vol > 0 else False
 
     # ------------------------------------------------------------------
     # Candle body strength
     # ------------------------------------------------------------------
-    body = abs(breakout['close'] - breakout['open'])
-    candle_range = breakout['high'] - breakout['low']
-    body_ratio = (body / candle_range) if candle_range > 0 else 0
+    body_ratio = candle_body_ratio(open_price, close_price, breakout['high'], breakout['low'])
 
     # ------------------------------------------------------------------
-    # ATR-like volatility filter
+    # ATR-like volatility environment filter
     # ------------------------------------------------------------------
-    high_low = prev['high'] - prev['low']
-    if len(high_low) >= atr_window:
-        atr = high_low.rolling(window=atr_window).mean().iloc[-1]
-    else:
-        atr = high_low.mean()
-    avg_range = high_low.mean()
-    vol_env_ok = True
-    if not np.isnan(atr) and atr > 0:
-        vol_env_ok = avg_range >= atr_multiplier * atr
+    atr = compute_atr_like(prev, atr_window)
+    avg_range = (prev['high'] - prev['low']).mean()
+    vol_env_ok = avg_range >= atr_multiplier * atr if atr > 0 else True
 
     # ------------------------------------------------------------------
     # Trend filter using EMA cross
@@ -83,18 +107,13 @@ def check_breakout(df_last21: pd.DataFrame,
     trend_long = ema_fast > ema_slow
     trend_short = ema_fast < ema_slow
 
-    close = breakout['close']
-    open_ = breakout['open']
+    # ------------------------------------------------------------------
+    # Breakout strength filters
+    # ------------------------------------------------------------------
+    strong_long = (open_price > resistance * 0.995) and (close_price > resistance)
+    strong_short = (open_price < support * 1.005) and (close_price < support)
 
-    # ------------------------------------------------------------------
-    # Define breakout strength (reduce wick-based false breakouts)
-    # ------------------------------------------------------------------
-    strong_long = (open_ > resistance * 0.995) and (close > resistance)
-    strong_short = (open_ < support * 1.005) and (close < support)
-
-    # ------------------------------------------------------------------
     # Context container
-    # ------------------------------------------------------------------
     ctx = {
         "trend_long": trend_long,
         "trend_short": trend_short,
@@ -108,90 +127,82 @@ def check_breakout(df_last21: pd.DataFrame,
     }
 
     # ------------------------------------------------------------------
-    # Long / Short breakout conditions
+    # Final breakout conditions
     # ------------------------------------------------------------------
     long_cond = strong_long and vol_ok and (body_ratio >= min_body_ratio) and vol_env_ok and trend_long
     short_cond = strong_short and vol_ok and (body_ratio >= min_body_ratio) and vol_env_ok and trend_short
 
     # ------------------------------------------------------------------
-    # 🧠 Anti-Fakeout Dynamic Filters
+    # Anti-Fakeout Guards
     # ------------------------------------------------------------------
-    # Apply stricter thresholds for pending signals or when volatility is narrow.
     atr_buffer = PENDING_ATR_BUFFER_MULT * atr if atr > 0 else 0
-    fakeout_guard_long = (
-        (close - resistance) < atr_buffer or
+
+    fakeout_long = (
+        (close_price - resistance) < atr_buffer or
         body_ratio < PENDING_MIN_BODY_RATIO or
         breakout['volume'] < PENDING_MIN_VOL_MULT * avg_vol
     )
-    fakeout_guard_short = (
-        (support - close) < atr_buffer or
+
+    fakeout_short = (
+        (support - close_price) < atr_buffer or
         body_ratio < PENDING_MIN_BODY_RATIO or
         breakout['volume'] < PENDING_MIN_VOL_MULT * avg_vol
     )
 
     # ------------------------------------------------------------------
-    # Retest / Pending confirmation logic
+    # Retest or Pending Confirmation Logic
     # ------------------------------------------------------------------
     if confirm_retest or BREAKOUT_RETEST_REQUIRED:
-        # LONG pending confirm
-        if close > resistance and vol_ok and body_ratio >= BREAKOUT_MIN_BODY_RATIO and vol_env_ok:
+
+        # LONG breakout
+        if close_price > resistance and vol_ok and body_ratio >= BREAKOUT_MIN_BODY_RATIO and vol_env_ok:
             ctx["type"] = "LONG"
-            # If fails anti-fakeout guard => pending confirm
-            if fakeout_guard_long:
-                ctx["fakeout_flag"] = True
-                ctx["reason"] = "Weak candle or low volume after breakout"
-                signal, level = "PENDING_CONFIRM", resistance
-            else:
-                signal, level = "LONG", resistance
 
-            # 🧾 Debug trace
-            print(
-                f"[DEBUG BREAKOUT] signal={signal} | close={close:.2f}, open={open_:.2f}, "
+            signal = "PENDING_CONFIRM" if fakeout_long else "LONG"
+            ctx["fakeout_flag"] = fakeout_long
+            ctx["reason"] = "Weak candle or low volume after breakout" if fakeout_long else "Strong breakout"
+
+            debug_log(
+                f"signal={signal} | close={close_price:.2f}, open={open_price:.2f}, "
                 f"res={resistance:.2f}, sup={support:.2f}, ema_fast={ema_fast:.2f}, ema_slow={ema_slow:.2f}, "
-                f"trend_long={trend_long}, trend_short={trend_short}, vol_ok={vol_ok}, body_ratio={body_ratio:.3f}"
+                f"trend_long={trend_long}, vol_ok={vol_ok}, body_ratio={body_ratio:.3f}"
             )
-            return signal, level, ctx
+            return signal, resistance, ctx
 
-        # SHORT pending confirm
-        if close < support and vol_ok and body_ratio >= BREAKOUT_MIN_BODY_RATIO and vol_env_ok:
+        # SHORT breakout
+        if close_price < support and vol_ok and body_ratio >= BREAKOUT_MIN_BODY_RATIO and vol_env_ok:
             ctx["type"] = "SHORT"
-            if fakeout_guard_short:
-                ctx["fakeout_flag"] = True
-                ctx["reason"] = "Weak candle or low volume after breakdown"
-                signal, level = "PENDING_CONFIRM", support
-            else:
-                signal, level = "SHORT", support
 
-            # 🧾 Debug trace
-            print(
-                f"[DEBUG BREAKOUT] signal={signal} | close={close:.2f}, open={open_:.2f}, "
+            signal = "PENDING_CONFIRM" if fakeout_short else "SHORT"
+            ctx["fakeout_flag"] = fakeout_short
+            ctx["reason"] = "Weak candle or low volume after breakdown" if fakeout_short else "Strong breakdown"
+
+            debug_log(
+                f"signal={signal} | close={close_price:.2f}, open={open_price:.2f}, "
                 f"res={resistance:.2f}, sup={support:.2f}, ema_fast={ema_fast:.2f}, ema_slow={ema_slow:.2f}, "
-                f"trend_long={trend_long}, trend_short={trend_short}, vol_ok={vol_ok}, body_ratio={body_ratio:.3f}"
+                f"trend_short={trend_short}, vol_ok={vol_ok}, body_ratio={body_ratio:.3f}"
             )
-            return signal, level, ctx
+            return signal, support, ctx
 
     # ------------------------------------------------------------------
-    # Direct breakout confirmation (no retest required)
+    # Direct breakout confirmation (no retest needed)
     # ------------------------------------------------------------------
-    if long_cond and not fakeout_guard_long:
+    if long_cond and not fakeout_long:
         ctx["type"] = "LONG"
         signal, level = "LONG", resistance
-    elif short_cond and not fakeout_guard_short:
+
+    elif short_cond and not fakeout_short:
         ctx["type"] = "SHORT"
         signal, level = "SHORT", support
+
     else:
         signal, level = None, None
 
-    # 🧾 Debug trace (always log decision)
-    print(
-        f"[DEBUG BREAKOUT] signal={signal} | close={close:.2f}, open={open_:.2f}, "
+    # Log final decision
+    debug_log(
+        f"signal={signal} | close={close_price:.2f}, open={open_price:.2f}, "
         f"res={resistance:.2f}, sup={support:.2f}, ema_fast={ema_fast:.2f}, ema_slow={ema_slow:.2f}, "
         f"trend_long={trend_long}, trend_short={trend_short}, vol_ok={vol_ok}, body_ratio={body_ratio:.3f}"
     )
 
-    # ------------------------------------------------------------------
-    # Return result
-    # ------------------------------------------------------------------
-    if signal:
-        return signal, level, ctx
-    return None, None, {}
+    return (signal, level, ctx) if signal else (None, None, {})

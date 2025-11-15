@@ -54,7 +54,7 @@ def _get_value(key, default=None):
 def get_int(key, default=0):
     val = _get_value(key, default)
     try:
-        return int(val)
+        return int(str(val))
     except (TypeError, ValueError):
         logger.warning(f"⚠️ Invalid int for {key}={val!r}, using default {default}")
         return default
@@ -63,7 +63,7 @@ def get_int(key, default=0):
 def get_float(key, default=0.0):
     val = _get_value(key, default)
     try:
-        return float(val)
+        return float(str(val))
     except (TypeError, ValueError):
         logger.warning(f"⚠️ Invalid float for {key}={val!r}, using default {default}")
         return default
@@ -112,7 +112,8 @@ def load_config():
 
         # Smart Exit
         "USE_SMART_EXIT": get_bool("USE_SMART_EXIT", True),
-        "ATR_MULT_TP": get_float("ATR_MULT_TP", 2.0),
+        #"ATR_MULT_TP": get_float("ATR_MULT_TP", 2.0),
+        "ATR_MULT_TP": get_list("ATR_MULT_TP", ["2.0", "3.0", "4.0"]),
         "ATR_MULT_SL": get_float("ATR_MULT_SL", 1.0),
         "TRAILING_START_ATR": get_float("TRAILING_START_ATR", 1.5),
         "TRAILING_STEP_ATR": get_float("TRAILING_STEP_ATR", 0.5),
