@@ -3,6 +3,8 @@
 Modernized, cleaned, production-safe ExecutionManager implementation.
 - Removed background retry thread (Option A).
 - MarketIntegrityGuard suspicion -> immediate rejection (structured REJECTED_SUSPECT).
+- Prevent duplicate OPEN positions for the same symbol.
+- Do not cache a position if the exchange/guard returns a rejection or order failed.
 - Keeps original APIs and behavior but extracts helpers, unifies qty logic,
   and removes noisy logging.
 """
@@ -304,12 +306,19 @@ class ExecutionManager:
         """
         Open a futures position in a safe, traceable manner.
         If MarketIntegrityGuard flags the symbol -> return REJECTED_SUSPECT object (no retry, no cache).
+        Prevent opening a second OPEN position for same symbol.
         """
         load_dotenv(override=True)
         direction = direction.upper()
         is_long = direction in ("LONG", "BUY")
 
         try:
+            # ---- Prevent duplicate opens ----
+            existing = self.open_positions.get(symbol)
+            if existing and existing.get("status") == "OPEN":
+                logger.warning("Attempt to open %s for %s but an OPEN position already exists", direction, symbol)
+                return {"symbol": symbol, "status": "FAILED_ALREADY_OPEN", "reason": "already_open", "timestamp": datetime.utcnow().isoformat()}
+
             # Server time sync best-effort
             try:
                 server_time = getattr(self.client, "futures_time", lambda: None)()
@@ -444,10 +453,22 @@ class ExecutionManager:
                     type="MARKET",
                     quantity=qty,
                 )
-                logger.info("Opened %s %s @%s qty=%s", direction, symbol, price, qty)
+                logger.info("Placed market order for %s %s qty=%s", symbol, direction, qty)
             except Exception as e:
                 logger.exception("Market order failed for %s: %s", symbol, e)
                 return {"symbol": symbol, "status": "PENDING_ORDER_FAILED", "error": str(e)}
+
+            # ---- Safety: detect exchange/logic rejection and do not cache as OPEN ----
+            if isinstance(order_result, dict):
+                # common internal rejection statuses from our code / wrappers
+                bad_status = order_result.get("status")
+                code = order_result.get("code")
+                if bad_status in ("REJECTED_SUSPECT", "FAILED_VALIDATION", "PENDING_ORDER_FAILED", "FAILED_UNHANDLED"):
+                    logger.warning("Order resulted in failure status: %s", bad_status)
+                    return order_result
+                if isinstance(code, (int, float)) and int(code) < 0:
+                    logger.warning("Order returned error code: %s", code)
+                    return {"symbol": symbol, "status": "PENDING_ORDER_FAILED", "error": str(order_result)}
 
             # SmartExit integration (safety: only attempt when configured)
             smartexit_err = None
@@ -787,10 +808,10 @@ class ExecutionManager:
         last_result = None
         for sym in targets:
             try:
-                prev = self.smart_exit._get_position(sym) or {}
+                prev = getattr(self.smart_exit, "_get_position", lambda s: None)(sym) or {}
                 prev_sl = prev.get("sl")
                 res = self.smart_exit.manage_open_positions(sym)
-                post = self.smart_exit._get_position(sym) or {}
+                post = getattr(self.smart_exit, "_get_position", lambda s: None)(sym) or {}
                 new_sl = post.get("sl")
                 if res and isinstance(res, dict):
                     rtype = res.get("type")
