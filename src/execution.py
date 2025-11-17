@@ -304,35 +304,45 @@ class ExecutionManager:
         fixed_qty: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Open a futures position in a safe, traceable manner.
-        If MarketIntegrityGuard flags the symbol -> return REJECTED_SUSPECT object (no retry, no cache).
-        Prevent opening a second OPEN position for same symbol.
+        Safe, hardened position opener.
+        - No stale cache entries
+        - MarketIntegrityGuard enforced
+        - SmartExit protected
+        - Exchange reconciliation after order
         """
+
         load_dotenv(override=True)
         direction = direction.upper()
         is_long = direction in ("LONG", "BUY")
 
         try:
-            # ---- Prevent duplicate opens ----
+            # -----------------------------------------------------
+            # 🛑 1. Duplicate-open protection
+            # -----------------------------------------------------
             existing = self.open_positions.get(symbol)
             if existing and existing.get("status") == "OPEN":
-                logger.warning("Attempt to open %s for %s but an OPEN position already exists", direction, symbol)
-                return {"symbol": symbol, "status": "FAILED_ALREADY_OPEN", "reason": "already_open", "timestamp": datetime.utcnow().isoformat()}
+                logger.warning("Attempt to open %s for %s but an OPEN position exists", direction, symbol)
+                return {
+                    "symbol": symbol,
+                    "status": "FAILED_ALREADY_OPEN",
+                    "reason": "already_open",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
 
-            # Server time sync best-effort
+            # -----------------------------------------------------
+            # 2. Sync server time — best effort
+            # -----------------------------------------------------
             try:
                 server_time = getattr(self.client, "futures_time", lambda: None)()
                 if isinstance(server_time, dict) and "serverTime" in server_time:
                     offset = server_time["serverTime"] - int(time.time() * 1000)
-                    try:
-                        setattr(self.client, "time_offset", offset)
-                    except Exception:
-                        pass
+                    setattr(self.client, "time_offset", offset)
             except Exception:
                 logger.debug("Server time sync failed")
 
-            # Fetch price
-            price = None
+            # -----------------------------------------------------
+            # 3. Price fetch
+            # -----------------------------------------------------
             try:
                 price_data = self.client.ticker_price(symbol)
                 price = float(price_data["price"]) if isinstance(price_data, dict) else float(price_data)
@@ -344,22 +354,23 @@ class ExecutionManager:
                 logger.warning("Invalid price for %s: %s", symbol, price)
                 return None
 
-            # Symbol filters
+            # -----------------------------------------------------
+            # 4. Symbol filters
+            # -----------------------------------------------------
             filters = self._get_symbol_filters(symbol)
             tick = filters.get("tick", 0.0)
             step = filters.get("step", 0.0)
             min_qty = filters.get("min_qty")
 
-            # ATR-based TP/SL
+            # -----------------------------------------------------
+            # 5. ATR-based TP/SL
+            # -----------------------------------------------------
             atr = self._calc_atr(symbol)
             if atr and atr > 0:
                 env_tp = os.environ.get("ATR_MULT_TP")
                 tp_mults = self._safe_parse_tp_mults(env_tp)
                 raw_sl = os.environ.get("ATR_MULT_SL")
-                try:
-                    sl_mult = float(raw_sl) if raw_sl else 1.5
-                except Exception:
-                    sl_mult = 1.5
+                sl_mult = float(raw_sl) if raw_sl else 1.5
 
                 if is_long:
                     tp_levels = [self._round_to(price + atr * m, tick) for m in tp_mults]
@@ -368,6 +379,7 @@ class ExecutionManager:
                     tp_levels = [self._round_to(price - atr * m, tick) for m in tp_mults]
                     sl_price = self._round_to(price + atr * sl_mult, tick)
             else:
+                # % fallback
                 if is_long:
                     tp_levels = [self._round_to(price * (1 + tp_percent / 100.0), tick)]
                     sl_price = self._round_to(price * (1 - sl_percent / 100.0), tick)
@@ -375,7 +387,9 @@ class ExecutionManager:
                     tp_levels = [self._round_to(price * (1 - tp_percent / 100.0), tick)]
                     sl_price = self._round_to(price * (1 + sl_percent / 100.0), tick)
 
-            # Quantity calculation
+            # -----------------------------------------------------
+            # 6. Quantity calculation
+            # -----------------------------------------------------
             qty = self._calc_quantity(
                 symbol=symbol,
                 margin_usdt=None,
@@ -384,15 +398,16 @@ class ExecutionManager:
                 fixed_qty=fixed_qty,
                 leverage=None,
             )
+
             qty = self._round_to(qty, step) if step and step > 0 else round(qty, 6)
 
-            # Validate min_qty only
             if min_qty and qty < float(min_qty):
-                failure = {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"qty<{min_qty}"}
-                logger.error("Qty validation failed for %s: %s < %s", symbol, qty, min_qty)
-                return failure
+                logger.error("Qty validation failed for %s: qty %s < min_qty %s", symbol, qty, min_qty)
+                return {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"qty<{min_qty}"}
 
-            # DRY-RUN
+            # -----------------------------------------------------
+            # 7. DRY-RUN mode
+            # -----------------------------------------------------
             if self.dry_run:
                 pos = {
                     "symbol": symbol,
@@ -409,10 +424,13 @@ class ExecutionManager:
                 logger.info("DRY-RUN: %s %s qty=%s", direction, symbol, qty)
                 return pos
 
-            # Market integrity checks -> REJECT immediately (no caching / no pending)
+            # -----------------------------------------------------
+            # 8. Market Integrity Guard
+            # -----------------------------------------------------
             orderbook = self._fetch_orderbook(symbol)
             trades = self._fetch_recent_trades(symbol)
             suspect, reason = self.guard.check(orderbook, trades, events_per_sec=0.0)
+
             if suspect:
                 logger.warning("MarketIntegrityGuard rejected %s: %s", symbol, reason)
                 return {
@@ -422,30 +440,24 @@ class ExecutionManager:
                     "timestamp": datetime.utcnow().isoformat(),
                 }
 
-            # Set leverage (best-effort)
+            # -----------------------------------------------------
+            # 9. Pre-order notional validation
+            # -----------------------------------------------------
             try:
-                if hasattr(self.client, "futures_change_leverage"):
-                    self.client.futures_change_leverage(symbol=symbol, leverage=int(LEVERAGE or 10))
-            except Exception:
-                logger.debug("Leverage set failed for %s", symbol)
-
-            # PRE-ORDER VALIDATION (minNotional re-check)
-            try:
-                price_data = self.client.ticker_price(symbol=symbol)
-                live_price = float(price_data["price"])
+                live_price = float(self.client.ticker_price(symbol)["price"])
             except Exception:
                 live_price = price
 
-            min_notional = float(filters.get("min_notional", 0.0) or 0.0)
+            min_notional = float(filters.get("min_notional") or 0.0)
             notional = float(qty) * float(live_price)
 
-            logger.debug("Pre-Order Validation: qty=%s price=%s notional=%s minNotional=%s", qty, live_price, notional, min_notional)
-
             if min_notional and notional < min_notional:
-                logger.error("ORDER BLOCKED — Notional %.8f < minNotional %.8f", notional, min_notional)
-                return {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"notional {notional:.8f} < minNotional {min_notional}"}
+                logger.error("ORDER BLOCKED: notional %.8f < min_notional %.8f", notional, min_notional)
+                return {"symbol": symbol, "status": "FAILED_VALIDATION", "error": f"notional {notional:.8f} < {min_notional}"}
 
-            # Place market order
+            # -----------------------------------------------------
+            # 10. MARKET ORDER → attempt execution
+            # -----------------------------------------------------
             try:
                 order_result = self.client.futures_create_order(
                     symbol=symbol,
@@ -453,24 +465,31 @@ class ExecutionManager:
                     type="MARKET",
                     quantity=qty,
                 )
-                logger.info("Placed market order for %s %s qty=%s", symbol, direction, qty)
+                logger.info("Market order placed for %s %s qty=%s", symbol, direction, qty)
             except Exception as e:
                 logger.exception("Market order failed for %s: %s", symbol, e)
                 return {"symbol": symbol, "status": "PENDING_ORDER_FAILED", "error": str(e)}
 
-            # ---- Safety: detect exchange/logic rejection and do not cache as OPEN ----
+            # -----------------------------------------------------
+            # 🧹 11. POST-ORDER SAFETY — reject if order_result is bad
+            # -----------------------------------------------------
             if isinstance(order_result, dict):
-                # common internal rejection statuses from our code / wrappers
                 bad_status = order_result.get("status")
                 code = order_result.get("code")
-                if bad_status in ("REJECTED_SUSPECT", "FAILED_VALIDATION", "PENDING_ORDER_FAILED", "FAILED_UNHANDLED"):
-                    logger.warning("Order resulted in failure status: %s", bad_status)
-                    return order_result
-                if isinstance(code, (int, float)) and int(code) < 0:
-                    logger.warning("Order returned error code: %s", code)
-                    return {"symbol": symbol, "status": "PENDING_ORDER_FAILED", "error": str(order_result)}
 
-            # SmartExit integration (safety: only attempt when configured)
+                if bad_status in ("REJECTED_SUSPECT", "FAILED_VALIDATION", "PENDING_ORDER_FAILED", "FAILED_UNHANDLED"):
+                    return order_result
+
+                if isinstance(code, (int, float)) and int(code) < 0:
+                    return {
+                        "symbol": symbol,
+                        "status": "PENDING_ORDER_FAILED",
+                        "error": str(order_result),
+                    }
+
+            # -----------------------------------------------------
+            # 🧠 12. SmartExit (with safety)
+            # -----------------------------------------------------
             smartexit_err = None
             if USE_SMART_EXIT:
                 try:
@@ -489,11 +508,31 @@ class ExecutionManager:
                     smartexit_err = str(e)
                     logger.exception("SmartExit.create_exit_orders failed for %s: %s", symbol, e)
 
+            # -----------------------------------------------------
+            # 🔥 13. FINAL SAFETY — RECONCILE WITH LIVE EXCHANGE
+            # -----------------------------------------------------
+            time.sleep(0.5)
+
+            pos = None
+            try:
+                pos = self.smart_exit._get_position(symbol)
+            except Exception:
+                pos = None
+
+            if not pos:
+                # Order placed but no actual position detected → treat as FAIL
+                logger.error("Order executed but no exchange position found — clearing cache")
+                self.open_positions.pop(symbol, None)
+                return {"symbol": symbol, "status": "FAILED_NO_POSITION_AFTER_ORDER"}
+
+            # -----------------------------------------------------
+            # 💾 14. Cache only REAL exchange-confirmed position
+            # -----------------------------------------------------
             tracked = {
                 "symbol": symbol,
-                "side": direction,
-                "entry": price,
-                "qty": qty,
+                "side": pos["side"],
+                "entry": pos["entry"],
+                "qty": pos["qty"],
                 "tp_levels": tp_levels,
                 "sl": sl_price,
                 "atr": atr,
@@ -502,12 +541,14 @@ class ExecutionManager:
                 "order_result": order_result,
                 "smartexit_error": smartexit_err,
             }
+
             self.open_positions[symbol] = tracked
             return tracked
 
         except Exception as e:
             logger.exception("Unhandled open_position error for %s: %s", symbol, e)
             return {"symbol": symbol, "status": "FAILED_UNHANDLED", "error": str(e)}
+
 
     # ---------------------------
     # Reusable network helpers
