@@ -195,6 +195,97 @@ class ExecutionManager:
             return value
 
     # ---------------------------
+    # Helper: is there an open position on the exchange?
+    # ---------------------------
+    def _is_open_on_exchange(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Try multiple methods to determine whether the exchange currently reports
+        an open position for `symbol`. Returns normalized dict {'side','qty','entry','sl'} or None.
+        """
+        try:
+            sym = symbol.upper()
+            # 1) Preferred: smart_exit helper (already normalizes)
+            try:
+                if hasattr(self.smart_exit, "_get_position"):
+                    pos = self.smart_exit._get_position(sym)
+                    if pos:
+                        return pos
+            except Exception:
+                pass
+
+            # 2) Direct client.get_position (many clients expose this)
+            try:
+                if hasattr(self.client, "get_position"):
+                    p = self.client.get_position(sym)
+                    if isinstance(p, dict) and p:
+                        # normalize similar to SmartExit expectations
+                        qty = safe_float(p.get("positionAmt") or p.get("position") or p.get("qty") or p.get("quantity") or 0.0)
+                        entry = safe_float(p.get("entryPrice") or p.get("avgPrice") or p.get("price") or 0.0)
+                        side = None
+                        if qty > 0:
+                            side = "LONG"
+                        elif qty < 0:
+                            side = "SHORT"
+                        if side is None or abs(qty) <= 0:
+                            return None
+                        sl_val = None
+                        for k in ("stopPrice", "stop_price", "stopLoss", "stop_loss"):
+                            if k in p and p.get(k) not in (None, "", 0, "0"):
+                                sl_val = safe_float(p.get(k))
+                                break
+                        return {"side": side, "qty": abs(qty), "entry": entry, "sl": sl_val}
+            except Exception:
+                pass
+
+            # 3) Position risk or all positions (list) fallback
+            try:
+                if hasattr(self.client, "get_position_risk"):
+                    pr = self.client.get_position_risk(symbol)
+                    if isinstance(pr, list) and pr:
+                        for item in pr:
+                            if isinstance(item, dict) and (item.get("symbol") == sym or item.get("symbol") == symbol):
+                                qty = safe_float(item.get("positionAmt") or item.get("position") or 0.0)
+                                entry = safe_float(item.get("entryPrice") or item.get("avgPrice") or 0.0)
+                                if abs(qty) > 0:
+                                    side = "LONG" if qty > 0 else "SHORT"
+                                    sl_val = None
+                                    for k in ("stopPrice", "stop_price", "stopLoss", "stop_loss"):
+                                        if k in item and item.get(k) not in (None, "", 0, "0"):
+                                            sl_val = safe_float(item.get(k))
+                                            break
+                                    return {"side": side, "qty": abs(qty), "entry": entry, "sl": sl_val}
+            except Exception:
+                pass
+
+            # 4) REST fallback: get_all_positions / futures_position_information
+            try:
+                candidates = []
+                if hasattr(self.client, "get_all_positions"):
+                    candidates = self.client.get_all_positions() or []
+                elif hasattr(self.client, "futures_position_information"):
+                    candidates = self.client.futures_position_information() or []
+                for item in (candidates or []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("symbol") == sym or item.get("symbol") == symbol:
+                        qty = safe_float(item.get("positionAmt") or item.get("position") or item.get("quantity") or 0.0)
+                        entry = safe_float(item.get("entryPrice") or item.get("avgPrice") or 0.0)
+                        if abs(qty) > 0:
+                            side = "LONG" if qty > 0 else "SHORT"
+                            sl_val = None
+                            for k in ("stopPrice", "stop_price", "stopLoss", "stop_loss"):
+                                if k in item and item.get(k) not in (None, "", 0, "0"):
+                                    sl_val = safe_float(item.get(k))
+                                    break
+                            return {"side": side, "qty": abs(qty), "entry": entry, "sl": sl_val}
+            except Exception:
+                pass
+
+        except Exception:
+            logger.debug("_is_open_on_exchange unexpected error", exc_info=True)
+        return None
+
+    # ---------------------------
     # Unified quantity calculation
     # ---------------------------
     def _calc_quantity(
@@ -312,22 +403,36 @@ class ExecutionManager:
         """
 
         load_dotenv(override=True)
+        # normalize symbol consistently for cache/exchange checks
+        symbol = symbol.upper()
         direction = direction.upper()
         is_long = direction in ("LONG", "BUY")
 
         try:
             # -----------------------------------------------------
-            # 🛑 1. Duplicate-open protection
+            # 🛑 1. Duplicate-open protection (verify with exchange before honoring cache)
             # -----------------------------------------------------
             existing = self.open_positions.get(symbol)
             if existing and existing.get("status") == "OPEN":
-                logger.warning("Attempt to open %s for %s but an OPEN position exists", direction, symbol)
-                return {
-                    "symbol": symbol,
-                    "status": "FAILED_ALREADY_OPEN",
-                    "reason": "already_open",
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
+                # double-check exchange state in case cache is stale
+                try:
+                    exch_pos = self._is_open_on_exchange(symbol)
+                    if exch_pos:
+                        logger.warning("Attempt to open %s for %s but an OPEN position already exists (confirmed by exchange)", direction, symbol)
+                        return {
+                            "symbol": symbol,
+                            "status": "FAILED_ALREADY_OPEN",
+                            "reason": "already_open",
+                            "timestamp": datetime.utcnow().isoformat(),
+                        }
+                    else:
+                        # stale cache: remove and continue
+                        logger.info("Found stale OPEN cache for %s — clearing and continuing", symbol)
+                        self.open_positions.pop(symbol, None)
+                except Exception:
+                    # if exchange check fails, be conservative and allow opening (rather than block)
+                    logger.debug("Exchange check failed while validating existing cache for %s — clearing local cache and continuing", symbol)
+                    self.open_positions.pop(symbol, None)
 
             # -----------------------------------------------------
             # 2. Sync server time — best effort
