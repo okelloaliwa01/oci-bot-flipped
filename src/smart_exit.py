@@ -284,12 +284,21 @@ class SmartExitManager:
     # -------------------------
     def _cancel_all_exit_orders(self, symbol: str) -> List[Any]:
         """
-        Cancel TP/SL/reduceOnly orders for the symbol.
-        Expects: client.get_open_orders(symbol) -> list of dicts with keys 'type','reduceOnly','orderId'
-                 client.cancel_order(symbol=symbol, order_id=orderId)
+        Cancel all SL/TP/reduce-only exit orders for the given symbol.
+        Compatible with REST clients exposing:
+            - get_open_orders(symbol)
+            - cancel_order(symbol=symbol, order_id=...)
+            - cancel_order(symbol=symbol, orderId=...)
+            - futures_cancel_all_open_orders(symbol)
+        Returns a list of cancelled order IDs or dictionaries describing what was cancelled.
         """
+
         cancelled: List[Any] = []
+
         try:
+            # ──────────────────────────────────────────────────────────────
+            # 1. Ensure the client exposes some kind of order-list API
+            # ──────────────────────────────────────────────────────────────
             if not hasattr(self.client, "get_open_orders"):
                 return cancelled
 
@@ -297,39 +306,120 @@ class SmartExitManager:
             if not isinstance(orders, list):
                 return cancelled
 
+            # ──────────────────────────────────────────────────────────────
+            # 2. Inspect each order and cancel if it's TP / SL / reduceOnly
+            # ──────────────────────────────────────────────────────────────
             for o in orders:
                 try:
                     if not isinstance(o, dict):
                         continue
-                    order_type = str(o.get("type") or o.get("orderType") or "").upper()
-                    reduce_only = bool(o.get("reduceOnly") or o.get("reduce_only") or False)
-                    if "TAKE" in order_type or "STOP" in order_type or reduce_only:
-                        oid = o.get("orderId") or o.get("order_id") or o.get("id") or o.get("clientOrderId")
-                        if not oid:
-                            # no id we can cancel individually; attempt symbol-wide cancel if available
-                            try:
-                                if hasattr(self.client, "futures_cancel_all_open_orders"):
-                                    self.client.futures_cancel_all_open_orders(symbol=symbol)
-                                    cancelled.append({"cancel_all": True, "symbol": symbol})
-                            except Exception:
-                                _debug_logger.exception("cancel-all variant failed for %s", symbol)
-                            continue
-                        # try unified cancel_order signature
+
+                    # Normalize type + reduceOnly flag
+                    order_type = str(
+                        o.get("type") or o.get("orderType") or ""
+                    ).upper()
+
+                    reduce_only = bool(
+                        o.get("reduceOnly")
+                        or o.get("reduce_only")
+                        or o.get("reduce")  # some exchange libs use this
+                        or False
+                    )
+
+                    is_exit_type = (
+                        "TAKE" in order_type
+                        or "STOP" in order_type
+                        or "TP" in order_type
+                    )
+
+                    # Only cancel TP/SL/reduce-only orders
+                    if not (is_exit_type or reduce_only):
+                        continue
+
+                    # Extract order IDs safely
+                    oid = (
+                        o.get("orderId")
+                        or o.get("order_id")
+                        or o.get("id")
+                        or o.get("clientOrderId")
+                    )
+
+                    # No individual ID → attempt full cancel
+                    if not oid:
                         try:
-                            self.client.cancel_order(symbol=symbol, order_id=oid)
-                            cancelled.append(oid)
+                            if hasattr(self.client, "futures_cancel_all_open_orders"):
+                                self.client.futures_cancel_all_open_orders(symbol=symbol)
+                                cancelled.append({"cancel_all": True, "symbol": symbol})
+                                _debug_logger.info(
+                                    "Cancelled all exit orders for %s (missing individual ID)", symbol
+                                )
+                                continue
                         except Exception:
-                            # last resort: try passing orderId name
-                            try:
-                                self.client.cancel_order(symbol=symbol, orderId=oid)  # some clients accept this
-                                cancelled.append(oid)
-                            except Exception:
-                                _debug_logger.exception("cancel_order failed for %s %s", symbol, oid)
+                            _debug_logger.exception(
+                                "Symbol-level cancel_all failed for %s", symbol
+                            )
+                        continue
+
+                    # Try cancel using typical Binance signature
+                    try:
+                        self.client.cancel_order(symbol=symbol, order_id=oid)
+                        cancelled.append(oid)
+                        continue
+
+                    except Exception:
+                        # Try alternative signature
+                        try:
+                            self.client.cancel_order(symbol=symbol, orderId=oid)
+                            cancelled.append(oid)
+                            continue
+                        except Exception:
+                            _debug_logger.exception(
+                                "cancel_order failed for %s (id=%s)", symbol, oid
+                            )
+                            continue
+
                 except Exception:
+                    _debug_logger.exception("Error handling exit order for %s", symbol)
                     continue
+
+            # ──────────────────────────────────────────────────────────────
+            # 3. Additional fallback: ensure *all remaining* symbol orders are closed
+            # ──────────────────────────────────────────────────────────────
+            try:
+                if hasattr(self.client, "futures_cancel_all_open_orders"):
+                    self.client.futures_cancel_all_open_orders(symbol=symbol)
+            except Exception:
+                # Not fatal — best effort only
+                pass
+
         except Exception:
-            _debug_logger.exception("_cancel_all_exit_orders failed")
+            _debug_logger.exception("_cancel_all_exit_orders unexpected failure")
+
         return cancelled
+
+
+        # -------------------------------------------------------------
+    # Public wrappers so ExecutionManager can call them safely
+    # -------------------------------------------------------------
+    def cancel_all_exit_orders(self, symbol: str):
+        """
+        Public wrapper around _cancel_all_exit_orders().
+        Exists so external modules (ExecutionManager) do not need
+        to access private methods directly.
+        """
+        try:
+            return self._cancel_all_exit_orders(symbol)
+        except Exception:
+            _debug_logger.exception("cancel_all_exit_orders wrapper failed for %s", symbol)
+            return []
+
+    def cancel_all_reduce_only(self, symbol: str):
+        """
+        Alias for readability. Some code uses reduce-only semantics.
+        """
+        return self.cancel_all_exit_orders(symbol)
+
+
 
     # -------------------------
     # Trailing / Breakeven handling
@@ -343,84 +433,95 @@ class SmartExitManager:
             qty = position.get("qty", 0.0)
             cur_sl = position.get("sl")
 
-            if side not in ("LONG", "SHORT"):
+            if side not in ("LONG", "SHORT") or qty <= 0:
                 return None
 
-            profit = abs(float(last_price) - float(entry))
+            profit = abs(last_price - entry)
+            updates: List[Dict[str, Any]] = []
 
-            # trailing
-            if profit >= (self.trailing_start_atr * atr):
-                if side == "LONG":
-                    proposed_sl_raw = float(last_price) - self.trailing_step_atr * atr
-                else:
-                    proposed_sl_raw = float(last_price) + self.trailing_step_atr * atr
-
+            # --- Trailing SL ---
+            if profit >= self.trailing_start_atr * atr:
+                proposed_trailing_sl = (
+                    last_price - self.trailing_step_atr * atr if side == "LONG" else last_price + self.trailing_step_atr * atr
+                )
                 if hasattr(self.client, "round_price"):
-                    proposed_sl = self.client.round_price(symbol, proposed_sl_raw)
+                    proposed_trailing_sl = self.client.round_price(symbol, proposed_trailing_sl)
                 else:
-                    proposed_sl = float(round(proposed_sl_raw, 8))
+                    proposed_trailing_sl = round(proposed_trailing_sl, 8)
 
-                improved = False
-                if cur_sl is None:
-                    improved = True
-                else:
-                    if side == "LONG" and proposed_sl > float(cur_sl):
-                        improved = True
-                    if side == "SHORT" and proposed_sl < float(cur_sl):
-                        improved = True
-
+                improved = (
+                    cur_sl is None
+                    or (side == "LONG" and proposed_trailing_sl > cur_sl)
+                    or (side == "SHORT" and proposed_trailing_sl < cur_sl)
+                )
                 if improved:
                     try:
                         if hasattr(self.client, "update_stop_loss"):
-                            res = self.client.update_stop_loss(symbol, side, qty, proposed_sl)
-                            return {"type": "trailing", "symbol": symbol, "new_sl": proposed_sl, "result": res}
+                            res = self.client.update_stop_loss(symbol, side, qty, proposed_trailing_sl)
+                            updates.append({
+                                "type": "trailing",
+                                "symbol": symbol,
+                                "old_sl": cur_sl,
+                                "new_sl": proposed_trailing_sl,
+                                "profit": profit,
+                                "atr": atr,
+                                "result": res
+                            })
+                            cur_sl = proposed_trailing_sl  # update for next check
                     except Exception:
                         _debug_logger.exception("Trailing SL update failed")
 
-            # breakeven
-            if profit >= (self.breakeven_atr * atr):
-                if side == "LONG":
-                    proposed_sl_raw = float(entry) + self.breakeven_buffer_pts * atr
-                else:
-                    proposed_sl_raw = float(entry) - self.breakeven_buffer_pts * atr
-
+            # --- Breakeven SL ---
+            if profit >= self.breakeven_atr * atr:
+                proposed_breakeven_sl = (
+                    entry + self.breakeven_buffer_pts * atr if side == "LONG" else entry - self.breakeven_buffer_pts * atr
+                )
                 if hasattr(self.client, "round_price"):
-                    proposed_sl = self.client.round_price(symbol, proposed_sl_raw)
+                    proposed_breakeven_sl = self.client.round_price(symbol, proposed_breakeven_sl)
                 else:
-                    proposed_sl = float(round(proposed_sl_raw, 8))
+                    proposed_breakeven_sl = round(proposed_breakeven_sl, 8)
 
-                improved = False
-                if cur_sl is None:
-                    improved = True
-                else:
-                    if side == "LONG" and proposed_sl > float(cur_sl):
-                        improved = True
-                    if side == "SHORT" and proposed_sl < float(cur_sl):
-                        improved = True
-
+                improved = (
+                    cur_sl is None
+                    or (side == "LONG" and proposed_breakeven_sl > cur_sl)
+                    or (side == "SHORT" and proposed_breakeven_sl < cur_sl)
+                )
                 if improved:
                     try:
                         if hasattr(self.client, "update_stop_loss"):
-                            res = self.client.update_stop_loss(symbol, side, qty, proposed_sl)
-                            return {"type": "breakeven", "symbol": symbol, "new_sl": proposed_sl, "result": res}
+                            res = self.client.update_stop_loss(symbol, side, qty, proposed_breakeven_sl)
+                            updates.append({
+                                "type": "breakeven",
+                                "symbol": symbol,
+                                "old_sl": cur_sl,
+                                "new_sl": proposed_breakeven_sl,
+                                "profit": profit,
+                                "atr": atr,
+                                "result": res
+                            })
+                            cur_sl = proposed_breakeven_sl
                     except Exception:
-                        _debug_logger.exception("Breakeven update failed")
+                        _debug_logger.exception("Breakeven SL update failed")
 
+            if updates:
+                return updates[-1]  # return latest action
             return None
+
         except Exception:
             _debug_logger.exception("_handle_trailing_and_breakeven failure")
             return None
+
 
     # -------------------------
     # Main periodic executor
     # -------------------------
     def manage_open_positions(self, symbol: str) -> Dict[str, Any]:
         """
-        Called periodically to enforce trailing/breakeven SLs.
-        Returns a dict describing action or noop.
+        Periodic executor to enforce trailing/breakeven SLs.
+        Returns a detailed dict describing action or noop.
         """
         try:
-            load_dotenv(override=True)
+            # refresh env config only if changed
             self.use = os.getenv("USE_SMART_EXIT", str(self.use)).lower() == "true"
             if not self.use:
                 return {"type": "noop", "reason": "disabled"}
@@ -438,21 +539,34 @@ class SmartExitManager:
                 return {"type": "noop", "reason": "invalid_atr"}
 
             last_price = float(df["close"].iloc[-1])
-
             position = self._get_position(symbol)
             if not position:
-                # no position: cancel any leftover exit orders for safety
                 try:
                     self._cancel_all_exit_orders(symbol)
                 except Exception:
                     _debug_logger.exception("cancel all exit orders when no position failed")
                 return {"type": "noop", "reason": "no_position"}
 
+            # handle trailing + breakeven
             result = self._handle_trailing_and_breakeven(symbol, position, last_price, atr)
-            return result or {"type": "noop", "reason": "no_update"}
+            if result:
+                logger.info(
+                    "[SmartExit] %s: %s updated SL %s -> %s (profit=%.4f, ATR=%.4f)",
+                    symbol,
+                    result.get("type"),
+                    result.get("old_sl"),
+                    result.get("new_sl"),
+                    result.get("profit"),
+                    result.get("atr")
+                )
+                return result
+
+            return {"type": "noop", "reason": "no_update", "profit": abs(last_price - position["entry"]), "atr": atr}
+
         except Exception as e:
             _debug_logger.exception("manage_open_positions fatal error")
             return {"type": "error", "error": str(e)}
+
 
     # -------------------------
     # Create TP/SL after opening position
@@ -469,8 +583,18 @@ class SmartExitManager:
         tp_levels: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         """
-        Create initial SL + TP orders immediately after opening a position,
-        using unified client APIs and validating against exchange filters.
+        Create initial Stop Loss (SL) and Take Profit (TP) orders immediately after opening a position.
+        Returns a dict with order details and any errors.
+
+        Parameters:
+        - symbol: trading symbol
+        - side: "LONG"/"SHORT"
+        - entry_price: entry price of the position
+        - qty: position quantity
+        - atr_value: optional ATR value for SL/TP calculation
+        - tick_size: optional override for price rounding
+        - step_size: optional override for quantity rounding
+        - tp_levels: optional custom TP levels
         """
         try:
             if not self.use:
@@ -478,56 +602,48 @@ class SmartExitManager:
 
             is_long = side.upper() in ("LONG", "BUY")
 
-            # symbol filters (caller-provided tick/step override if present)
+            # --- Symbol filters ---
             filters = self._get_symbol_info_filters(symbol)
-            tick = float(tick_size or filters.get("tick", 0.0) or 0.0)
-            step = float(step_size or filters.get("step", 0.0) or 0.0)
-            min_qty = float(filters.get("min_qty", 0.0) or 0.0)
-            min_notional = float(filters.get("min_notional", 0.0) or 0.0)
+            tick = float(tick_size or filters.get("tick", 0.0))
+            step = float(step_size or filters.get("step", 0.0))
+            min_qty = float(filters.get("min_qty", 0.0))
+            min_notional = float(filters.get("min_notional", 0.0))
 
-            # sanity qty
-            if qty is None or qty <= 0:
+            if qty <= 0:
                 _debug_logger.debug("create_exit_orders: qty <= 0 for %s, skipping", symbol)
                 return {"status": "SKIPPED_ZERO_QTY"}
 
-            # SL calculation
-            if atr_value:
-                sl_raw = (entry_price - (self.atr_mult_sl * atr_value)) if is_long else (entry_price + (self.atr_mult_sl * atr_value))
-            else:
-                sl_raw = entry_price * (0.997 if is_long else 1.003)
-
+            # --- Stop Loss calculation ---
+            sl_raw = (
+                entry_price - (self.atr_mult_sl * atr_value) if is_long else entry_price + (self.atr_mult_sl * atr_value)
+            ) if atr_value else entry_price * (0.997 if is_long else 1.003)
             sl_price = self.round_price(symbol, sl_raw)
 
-            # TP levels
+            # --- Take Profit levels ---
             if atr_value and not tp_levels:
-                tp_levels_calc: List[float] = []
-                for mult in (self.atr_mult_tp or []):
-                    p_raw = (entry_price + mult * atr_value) if is_long else (entry_price - mult * atr_value)
-                    tp_levels_calc.append(self.round_price(symbol, p_raw))
-                tp_levels = tp_levels_calc
+                tp_levels = [self.round_price(symbol, entry_price + mult * atr_value if is_long else entry_price - mult * atr_value)
+                            for mult in self.atr_mult_tp]
             elif tp_levels:
                 tp_levels = [self.round_price(symbol, float(p)) for p in tp_levels]
             else:
                 tp_levels = []
 
-            # DRY RUN
+            # --- DRY RUN ---
             if self.dry_run:
+                _debug_logger.info("[DRY_RUN] create_exit_orders: %s SL=%s TP=%s", symbol, sl_price, tp_levels)
                 return {"status": "DRY_RUN", "symbol": symbol, "sl": sl_price, "tp_levels": tp_levels}
 
-            # validate min_qty
+            # --- Quantity validation ---
             rounded_qty = self.round_qty(symbol, qty)
             if min_qty > 0 and rounded_qty < min_qty:
                 return {"status": "FAILED_VALIDATION", "error": f"rounded qty {rounded_qty} < min_qty {min_qty}"}
 
-            # optional min_notional check with mark price
+            # --- Optional min_notional check ---
             mark_price: Optional[float] = None
             try:
                 if hasattr(self.client, "ticker_price"):
                     price_data = self.client.ticker_price(symbol)
-                    if isinstance(price_data, dict):
-                        mark_price = safe_float(price_data.get("price"))
-                    else:
-                        mark_price = safe_float(price_data)
+                    mark_price = safe_float(price_data.get("price") if isinstance(price_data, dict) else price_data)
             except Exception:
                 mark_price = None
 
@@ -536,13 +652,13 @@ class SmartExitManager:
                 if notional < min_notional:
                     return {"status": "FAILED_VALIDATION", "error": f"notional {notional:.8f} < min_notional {min_notional}"}
 
-            # Cancel existing exit orders first
+            # --- Cancel existing exit orders ---
             try:
                 self._cancel_all_exit_orders(symbol)
             except Exception:
-                _debug_logger.exception("Could not cancel existing exit orders")
+                _debug_logger.exception("Could not cancel existing exit orders for %s", symbol)
 
-            # Place SL (STOP_MARKET)
+            # --- Place Stop Loss (STOP_MARKET) ---
             sl_res: Any = None
             try:
                 sl_res = self.client.futures_create_order(
@@ -558,13 +674,14 @@ class SmartExitManager:
                 _debug_logger.exception("Failed SL creation for %s: %s", symbol, e)
                 sl_res = {"error": str(e)}
 
-            # Place TP orders
+            # --- Place Take Profit orders ---
             tp_results: List[Any] = []
             if tp_levels:
-                per_tp_qty_raw = qty / len(tp_levels) if len(tp_levels) > 0 else qty
+                per_tp_qty_raw = qty / len(tp_levels)
                 per_tp_qty = self.round_qty(symbol, per_tp_qty_raw)
                 if min_qty > 0 and per_tp_qty < min_qty:
                     per_tp_qty = self.round_qty(symbol, min_qty)
+
                 for tp in tp_levels:
                     try:
                         res = self.client.futures_create_order(
@@ -581,6 +698,8 @@ class SmartExitManager:
                         _debug_logger.exception("Failed TP creation for %s at %s: %s", symbol, tp, e)
                         tp_results.append({"error": str(e)})
 
+            logger.info("[SmartExit] Exit orders created for %s: SL=%s TP=%s", symbol, sl_price, tp_levels)
+
             return {
                 "status": "OK",
                 "symbol": symbol,
@@ -588,10 +707,15 @@ class SmartExitManager:
                 "tp_levels": tp_levels,
                 "sl_result": sl_res,
                 "tp_results": tp_results,
+                "qty": rounded_qty,
+                "entry": entry_price,
+                "side": side.upper(),
             }
+
         except Exception:
             _debug_logger.exception("create_exit_orders failure")
             return {"status": "ERROR", "error": "create_exit_orders unexpected failure"}
+
 
     # -------------------------
     # Small wrappers that delegate to the client if present

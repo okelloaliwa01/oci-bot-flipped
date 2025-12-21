@@ -285,6 +285,82 @@ class ExecutionManager:
             logger.debug("_is_open_on_exchange unexpected error", exc_info=True)
         return None
 
+
+    # ---------------------------
+    # Post-exit cleanup (cancel reduce-only / exit orders)
+    # ---------------------------
+    def _post_exit_cleanup(self, symbol: str) -> None:
+        """
+        Ensure any TP/SL/reduce-only orders for `symbol` are cancelled.
+        Idempotent and safe to call even if SmartExit or client cancel APIs are missing.
+        """
+        try:
+            # 1) Prefer SmartExit public API if available
+            try:
+                if hasattr(self.smart_exit, "cancel_all_exit_orders"):
+                    cancelled = self.smart_exit.cancel_all_exit_orders(symbol)
+                    logger.info("SmartExit cancelled exit orders for %s: count=%s", symbol, len(cancelled) if isinstance(cancelled, list) else "unknown")
+                elif hasattr(self.smart_exit, "_cancel_all_exit_orders"):
+                    cancelled = self.smart_exit._cancel_all_exit_orders(symbol)
+                    logger.info("SmartExit (private) cancelled exit orders for %s: count=%s", symbol, len(cancelled) if isinstance(cancelled, list) else "unknown")
+            except Exception as e:
+                logger.warning("SmartExit cancel attempt failed for %s: %s", symbol, e)
+
+            # 2) As a fallback, attempt exchange-wide cancel for symbol
+            try:
+                if hasattr(self.client, "futures_cancel_all_open_orders"):
+                    self.client.futures_cancel_all_open_orders(symbol=symbol)
+                    logger.info("Exchange: futures_cancel_all_open_orders called for %s", symbol)
+                elif hasattr(self.client, "cancel_all_open_orders"):
+                    self.client.cancel_all_open_orders(symbol=symbol)
+                    logger.info("Exchange: cancel_all_open_orders called for %s", symbol)
+            except Exception as e:
+                logger.debug("Exchange-level cancel_all_open_orders failed for %s: %s", symbol, e)
+
+            # 3) Finally, attempt to cancel any open orders returned by get_open_orders individually
+            try:
+                if hasattr(self.client, "get_open_orders"):
+                    open_orders = self.client.get_open_orders(symbol) or []
+                elif hasattr(self.client, "futures_get_open_orders"):
+                    open_orders = self.client.futures_get_open_orders(symbol) or []
+                else:
+                    open_orders = []
+                for o in open_orders:
+                    try:
+                        oid = o.get("orderId") or o.get("order_id") or o.get("id") or o.get("clientOrderId")
+                        if not oid:
+                            continue
+                        # Try common cancel signatures
+                        try:
+                            self.client.cancel_order(symbol=symbol, order_id=oid)
+                        except Exception:
+                            try:
+                                self.client.cancel_order(symbol=symbol, orderId=oid)
+                            except Exception:
+                                # best effort; ignore
+                                continue
+                    except Exception:
+                        continue
+            except Exception:
+                logger.debug("Individual open-orders cancellation pass failed for %s", symbol)
+
+            # 4) Normalize local cache if no live position exists
+            try:
+                exch_pos = self._is_open_on_exchange(symbol)
+                if not exch_pos:
+                    # no live position — ensure cached entry removed
+                    if symbol in self.open_positions:
+                        self.open_positions.pop(symbol, None)
+                        logger.info("Post-exit cleanup: removed %s from local cache", symbol)
+                else:
+                    logger.debug("Post-exit cleanup: position still present on exchange for %s, skipping cache removal", symbol)
+            except Exception:
+                logger.debug("Post-exit cleanup: exchange position check failed for %s", symbol)
+
+        except Exception as e:
+            logger.exception("Post-exit cleanup unexpected failure for %s: %s", symbol, e)
+
+
     # ---------------------------
     # Unified quantity calculation
     # ---------------------------
@@ -881,8 +957,17 @@ class ExecutionManager:
             logger.error("Error closing %s: %s", symbol, err_text)
 
         # Cleanup
+                # Final cleanup: ensure any reduce-only/exit orders are cancelled and cache is normalized
+        try:
+            # best-effort post-exit cleanup (idempotent)
+            self._post_exit_cleanup(symbol)
+        except Exception as e:
+            logger.warning("Post-exit cleanup failed for %s: %s", symbol, e)
+
+        # Ensure local cache is removed
         self.open_positions.pop(symbol, None)
         logger.info("%s removed from local cache", symbol)
+
 
     # ---------------------------
     # Cancel orders
@@ -947,26 +1032,59 @@ class ExecutionManager:
     def reconcile_open_positions(self) -> Dict[str, Dict[str, Any]]:
         return self.open_positions
 
-    def manage_open_positions(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def manage_open_positions(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Manage open positions using SmartExit. Returns a dictionary mapping
+        symbols to SmartExit results.
+        """
         if not USE_SMART_EXIT:
-            return None
+            return {}
+
         targets = [symbol] if symbol else list(self.open_positions.keys())
-        last_result = None
+        results: Dict[str, Any] = {}
+        failed: List[str] = []
+
+        _get_position = getattr(self.smart_exit, "_get_position", lambda s: None)
+
         for sym in targets:
             try:
-                prev = getattr(self.smart_exit, "_get_position", lambda s: None)(sym) or {}
+                prev = _get_position(sym) or {}
                 prev_sl = prev.get("sl")
+                
                 res = self.smart_exit.manage_open_positions(sym)
-                post = getattr(self.smart_exit, "_get_position", lambda s: None)(sym) or {}
+                post = _get_position(sym) or {}
                 new_sl = post.get("sl")
+
+                # If SmartExit reports no live position but we still have cached OPEN, perform cleanup
+                if not post and sym in self.open_positions:
+                    try:
+                        logger.info("Detected external close for %s — running post-exit cleanup and clearing cache", sym)
+                        self._post_exit_cleanup(sym)
+                    except Exception as e:
+                        logger.warning("manage_open_positions post-exit cleanup failed for %s: %s", sym, e)
+                    # remove cached entry to stay consistent with exchange
+                    self.open_positions.pop(sym, None)
+
+
                 if res and isinstance(res, dict):
                     rtype = res.get("type")
                     if rtype in ("trailing", "breakeven") and new_sl != prev_sl:
                         logger.info("[SmartExit] %s SL change: %s -> %s", sym, prev_sl, new_sl)
-                last_result = res
+                    # Optional: log all SL changes
+                    elif new_sl != prev_sl:
+                        logger.debug("[SmartExit] %s SL changed (non-trailing/breakeven): %s -> %s", sym, prev_sl, new_sl)
+
+                results[sym] = res
+
             except Exception as e:
                 logger.exception("manage_open_positions failed for %s: %s", sym, e)
-        return last_result
+                failed.append(sym)
+
+        if failed:
+            logger.warning("manage_open_positions failed for symbols: %s", ", ".join(failed))
+
+        return results
+
 
     # ---------------------------
     # Cache utilities
@@ -987,6 +1105,9 @@ class ExecutionManager:
             if self.dry_run:
                 return self.open_positions
 
+            # ---------------------------
+            # 1. Fetch live positions
+            # ---------------------------
             live_positions_raw = []
             try:
                 if hasattr(self.client, "futures_position_information"):
@@ -998,17 +1119,26 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Could not fetch live positions: %s", e)
 
+            # ---------------------------
+            # 2. Normalize positions
+            # ---------------------------
             live_positions = {}
-            for p in (live_positions_raw or []):
+            for p in live_positions_raw or []:
                 try:
-                    amt = safe_float(p.get("positionAmt") or p.get("position") or p.get("quantity") or 0.0, 0.0)
+                    amt = safe_float(p.get("positionAmt") or p.get("position") or p.get("quantity") or 0.0)
                     if abs(amt) > 0:
-                        sym = p.get("symbol") or (p.get("symbol".upper()) if isinstance(p, dict) else None)
+                        sym = str(p.get("symbol") or "").upper()
                         if sym:
                             live_positions[sym] = p
+                            # Optionally update local cache with latest qty/sl
+                            if sym in self.open_positions:
+                                self.open_positions[sym].update({"qty": amt, "entry": safe_float(p.get("entryPrice") or 0.0)})
                 except Exception:
                     continue
 
+            # ---------------------------
+            # 3. Fetch open orders
+            # ---------------------------
             open_orders = []
             try:
                 if hasattr(self.client, "futures_get_open_orders"):
@@ -1018,18 +1148,35 @@ class ExecutionManager:
             except Exception as e:
                 logger.debug("Could not fetch open orders: %s", e)
 
-            order_symbols = {o.get("symbol") for o in (open_orders or []) if isinstance(o, dict)}
+            order_symbols = {str(o.get("symbol") or "").upper() for o in open_orders if isinstance(o, dict)}
+
+            # ---------------------------
+            # 4. Clean stale cache
+            # ---------------------------
             stale_cached = set(self.open_positions.keys()) - set(live_positions.keys())
             for s in stale_cached:
                 logger.info("Cleaning stale cache for %s", s)
+                try:
+                    self._post_exit_cleanup(s)
+                except Exception as e:
+                    logger.warning("Post-exit cleanup failed while cleaning stale cache for %s: %s", s, e)
                 self.remove_cached(s)
 
+
+            # ---------------------------
+            # 5. Detect orphaned orders
+            # ---------------------------
             orphaned = order_symbols - set(live_positions.keys())
             for s in orphaned:
                 logger.warning("Orphaned orders detected for %s", s)
 
-            logger.info("sync_exchange_state complete: %s live positions, %s cached", len(live_positions), len(self.open_positions))
+            logger.info(
+                "sync_exchange_state complete: %s live positions, %s cached",
+                len(live_positions),
+                len(self.open_positions),
+            )
             return live_positions
+
         except Exception as e:
             logger.exception("sync_exchange_state failed: %s", e)
             return {}
