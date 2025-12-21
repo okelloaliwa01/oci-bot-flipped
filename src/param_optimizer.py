@@ -38,11 +38,13 @@ from binance_client import BinanceClient
 import config
 from guards.market_integrity import MarketIntegrityGuard
 
+
+
 # ---------------------------
 # Configuration (local overrides)
 # ---------------------------
 CONFIG: Dict[str, Any] = {
-    "SYMBOL": getattr(config, "SYMBOL", "BTCUSDT"),
+    "SYMBOL": getattr(config, "SYMBOL", "XRPUSDT"),
     "TIMEFRAME": getattr(config, "TIMEFRAME", "5m"),
 
     # --- Data & Entry ---
@@ -62,12 +64,12 @@ CONFIG: Dict[str, Any] = {
     "MACD_SIGNAL": 5,
 
     # --- Optimization ---
-    "OPTUNA_TRIALS": int(os.getenv("OPTUNA_TRIALS", "300")),   # higher coverage for micro-movements
+    "OPTUNA_TRIALS": int(os.getenv("OPTUNA_TRIALS", "500")),   # higher coverage for micro-movements
     "CROSSVAL_FOLDS": int(os.getenv("CROSSVAL_FOLDS", "3")),
     "SEED": int(os.getenv("OPT_SEED", "42")),
 
     # --- Leverage & Execution ---
-    "LEVERAGE": getattr(config, "LEVERAGE", 40),               # aggressive but manageable with small margin
+    "LEVERAGE": getattr(config, "LEVERAGE", 60),               # aggressive but manageable with small margin
     # adjust MARGIN_USDT accordingly to reduce liquidation risk
 
     # --- RL Integration ---
@@ -83,9 +85,17 @@ CONFIG: Dict[str, Any] = {
 
     # --- Volatility Adaptation ---
     "ATR_PERCENT_VOL_THRESHOLD": float(os.getenv("ATR_PERCENT_VOL_THRESHOLD", "1.1")),
+    
 }
 
 random.seed(CONFIG["SEED"])
+
+# Load starting balance from .env (safe)
+try:
+    CONFIG["ACCOUNT_BALANCE"] = float(os.getenv("ACCOUNT_BALANCE", "10"))
+except Exception:
+    CONFIG["ACCOUNT_BALANCE"] = 10.0
+
 
 
 # ---------------------------
@@ -268,10 +278,8 @@ def simulate_trade_from_index(klines, start_index, params: Params, atrs, leverag
     tp_levels = [entry_price + atr * mult for mult in params.tp_levels_mults()]
     sl_price = entry_price - atr * params.atr_mult_sl
 
-    try:
-        starting_balance = float(config.ACCOUNT_BALANCE)
-    except Exception:
-        starting_balance = 10.79
+    starting_balance = float(CONFIG.get("ACCOUNT_BALANCE", 10.0))
+
 
     margin_usdt = (starting_balance * params.margin_percent / 100.0) if params.use_percent_margin else params.margin_usdt
     if margin_usdt <= 0:
@@ -322,29 +330,45 @@ def sharpe_like(returns: List[float]) -> float:
         return mean_r * math.sqrt(len(returns))
     return mean_r / std_r * math.sqrt(len(returns))
 
-def score_trades(trades: List[TradeResult]) -> Dict[str, float]:
+def score_trades(trades: List[TradeResult], starting_balance: float) -> Dict[str, float]:
     if not trades:
-        return {"total_return_usdt": 0.0, "max_drawdown": 0.0, "sharpe_like": 0.0, "win_rate": 0.0}
+        return {
+            "total_return_usdt": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe_like": 0.0,
+            "win_rate": 0.0,
+        }
+
     pnls = [t.pnl_usdt for t in trades]
     wins = [p for p in pnls if p > 0]
-    eq = [1000.0]
-    s = 1000.0
+
+    # dynamic starting balance
+    eq = [starting_balance]
+    s = starting_balance
+
     for p in pnls:
         s += p
         eq.append(s)
+
+    # max drawdown
     peak, mdd = eq[0], 0.0
     for val in eq:
         peak = max(peak, val)
         mdd = max(mdd, peak - val)
-    returns = [p / 1000.0 for p in pnls if p != 0.0]
+
+    # sharpe-like
+    returns = [p / starting_balance for p in pnls if p != 0.0]
     sharpe_val = sharpe_like(returns)
-    win_rate = len(wins) / len(trades) * 100.0 if trades else 0.0
+
+    win_rate = len(wins) / len(trades) * 100.0
+
     return {
-        "total_return_usdt": s - 1000.0,
+        "total_return_usdt": s - starting_balance,
         "max_drawdown": mdd,
         "sharpe_like": sharpe_val,
-        "win_rate": win_rate
+        "win_rate": win_rate,
     }
+
 
 # ---------------------------
 # .env writer / updater (unified, OCI-aware)
@@ -430,7 +454,11 @@ def evaluate_fold_wrapper(args):
         if tr is not None:
             trades.append(tr)
 
-    metrics = score_trades(trades)
+    # dynamic starting balance from .env
+    initial_balance = float(CONFIG["ACCOUNT_BALANCE"])
+    metrics = score_trades(trades, initial_balance)
+
+
 
     # >>> PATCH: Guard simulation
     guard = MarketIntegrityGuard(
@@ -766,7 +794,8 @@ def run_optuna_optimization(client: BinanceClient, n_trials: int = 50):
         "symbol": symbol,
         "timeframe": tf,
         "num_trades": len(final_trades),
-        "metrics": score_trades(final_trades),
+        "metrics": score_trades(final_trades, float(CONFIG["ACCOUNT_BALANCE"])),
+
     }
     with open("backtest_results.json", "w", encoding="utf-8") as f:
         json.dump(backtest_out, f, indent=2)

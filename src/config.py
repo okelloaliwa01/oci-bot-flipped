@@ -84,7 +84,7 @@ else:
 # ================================================================
 # 🔹 Core Trading Config
 # ================================================================
-SYMBOL: str = env_str("SYMBOL", "BTCUSDT") or "BTCUSDT"
+SYMBOL: str = env_str("SYMBOL", "XRPUSDT") or "XRPUSDT"
 TIMEFRAME: str = env_str("TIMEFRAME", "5m") or "5m"
 LEVERAGE: int = env_int("LEVERAGE", 10)
 

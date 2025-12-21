@@ -92,35 +92,37 @@ def get_list(key, default=None):
 # ⚙️ Unified Config Loader
 # --------------------------------------------
 def load_config():
-    """Load config parameters from config.py or environment."""
+    """Load ALL config parameters from environment variables first."""
     cfg = {
-        # Core
+        # ---------------- Core ----------------
         "USE_TESTNET": get_bool("USE_TESTNET", True),
         "DRY_RUN": get_bool("DRY_RUN", True),
-        "SYMBOL": get_str("SYMBOL", "BTCUSDT"),
+
+        # SYMBOL ALWAYS FROM .env
+        "SYMBOL": os.getenv("SYMBOL", "XRPUSDT"),
+
         "TIMEFRAME": get_str("TIMEFRAME", "5m"),
-        "LEVERAGE": get_int("LEVERAGE", 50),
+        "LEVERAGE": get_int("LEVERAGE", 40),
         "MARGIN_USDT": get_float("MARGIN_USDT", 1.0),
         "TP_PERCENT": get_float("TP_PERCENT", 0.3),
         "SL_PERCENT": get_float("SL_PERCENT", 0.15),
-        "VOLUME_MULTIPLIER": get_float("VOLUME_MULTIPLIER", 1.5),
+        "VOLUME_MULTIPLIER": get_float("VOLUME_MULTIPLIER", 1.0),
         "CANDLE_COUNT": get_int("CANDLE_COUNT", 100),
 
-        # MTF
+        # ---------------- MTF ----------------
         "MTF_CONFIRMATION": get_list("MTF_CONFIRMATION", []),
         "MTF_REQUIRED_CONFIRM": get_int("MTF_REQUIRED_CONFIRM", 1),
 
-        # Smart Exit
+        # ---------------- Smart Exit ----------------
         "USE_SMART_EXIT": get_bool("USE_SMART_EXIT", True),
-        #"ATR_MULT_TP": get_float("ATR_MULT_TP", 2.0),
-        "ATR_MULT_TP": get_list("ATR_MULT_TP", ["2.0", "3.0", "4.0"]),
+        "ATR_MULT_TP": get_list("ATR_MULT_TP", ["2.0", "3.0"]),
         "ATR_MULT_SL": get_float("ATR_MULT_SL", 1.0),
         "TRAILING_START_ATR": get_float("TRAILING_START_ATR", 1.5),
         "TRAILING_STEP_ATR": get_float("TRAILING_STEP_ATR", 0.5),
         "BREAKEVEN_ATR": get_float("BREAKEVEN_ATR", 1.0),
         "BREAKEVEN_BUFFER_PTS": get_float("BREAKEVEN_BUFFER_PTS", 50),
 
-        # Pending Breakout Config
+        # ---------------- Pending Breakout ----------------
         "PENDING_EXPIRY_CANDLES": get_int("PENDING_EXPIRY_CANDLES", 3),
         "PENDING_MAX_DISTANCE": get_float("PENDING_MAX_DISTANCE", 0.0035),
         "POST_TRADE_COOLDOWN": get_int("POST_TRADE_COOLDOWN", 1),
@@ -130,6 +132,7 @@ def load_config():
     }
 
     return cfg
+
 
 
 # --------------------------------------------

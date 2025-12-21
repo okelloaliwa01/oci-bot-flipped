@@ -235,7 +235,7 @@ def _release_lock():
 # ======================================================================
 def run_micro_optimizer():
     load_dotenv(override=True)
-    symbol = getattr(config, "SYMBOL", "BTCUSDT")
+    symbol = getattr(config, "SYMBOL", "XRPUSDT")
 
     if not _acquire_lock():
         logger.info("Optimizer already running (lock prevented duplicate).")
@@ -317,7 +317,7 @@ def atr_shock_monitor_background(symbol: str, client: BinanceClient, check_inter
 # ======================================================================
 if __name__ == "__main__":
     mode = os.getenv("MICRO_MODE", "single").lower()
-    symbol = getattr(config, "SYMBOL", "BTCUSDT")
+    symbol = getattr(config, "SYMBOL", "XRPUSDT")
     client = BinanceClient()
 
     if mode == "monitor":

@@ -140,6 +140,14 @@ def run():
     client = BinanceClient(use_testnet=USE_TESTNET)
     exec_m = ExecutionManager(client)
 
+    # Wire SmartExit back to execution (best-effort)
+    try:
+        if hasattr(exec_m, "smart_exit") and exec_m.smart_exit is not None:
+            exec_m.smart_exit.execution = exec_m
+            logger.debug("Wired smart_exit.execution -> exec_m")
+    except Exception as e:
+        logger.warning("Failed to wire smart_exit.execution: %s", e)
+
     try:
         client.set_leverage(SYMBOL, LEVERAGE)
     except Exception as e:
@@ -171,13 +179,40 @@ def run():
                 logger.warning(f"Position check failed: {e}")
                 has_pos = False
 
-            if has_pos and USE_SMART_EXIT:
+            # ----------------------------
+            # SmartExit monitoring stack
+            # ----------------------------
+            if USE_SMART_EXIT:
+                # 1) Per-symbol trailing/breakeven — only if position exists
+                if has_pos:
+                    try:
+                        result = exec_m.manage_open_positions(symbol=SYMBOL)
+                        if isinstance(result, dict):
+                            logger.info(f"📊 SmartExit Update: {result}")
+                    except Exception as e:
+                        logger.warning(f"manage_open_positions failed: {e}")
+
+                # 2) Mid-frequency enhanced monitor (if ExecutionManager provides it)
                 try:
-                    result = exec_m.manage_open_positions(symbol=SYMBOL)
-                    if isinstance(result, dict):
-                        logger.info(f"📊 SmartExit Update: {result}")
+                    if hasattr(exec_m, "enhanced_monitor"):
+                        # run universally each loop (best-effort)
+                        try:
+                            exec_m.enhanced_monitor()
+                        except Exception as em_err:
+                            logger.warning("enhanced_monitor execution failed: %s", em_err)
                 except Exception as e:
-                    logger.warning(f"SmartExit update failed: {e}")
+                    logger.warning(f"enhanced_monitor wrapper failed: {e}")
+
+                # 3) Optional global multi-symbol monitor on SmartExit
+                try:
+                    se = getattr(exec_m, "smart_exit", None)
+                    if se and hasattr(se, "monitor_all_positions"):
+                        try:
+                            se.monitor_all_positions()
+                        except Exception as e:
+                            logger.warning("smart_exit.monitor_all_positions failed: %s", e)
+                except Exception as e:
+                    logger.warning(f"monitor_all_positions wrapper failed: {e}")
 
             if not has_pos:
                 try:

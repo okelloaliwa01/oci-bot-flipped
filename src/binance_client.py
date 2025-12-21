@@ -833,7 +833,7 @@ class BinanceClient:
         try:
             dry = str(os.getenv("DRY_RUN", "false")).lower() in ("1", "true", "yes")
             logger.info("test_order_flow dry_run=%s", dry)
-            res = self.futures_create_order(symbol="BTCUSDT", side="BUY", type="MARKET", quantity=0.0001)
+            res = self.futures_create_order(symbol="XRPUSDT", side="BUY", type="MARKET", quantity=0.0001)
             logger.info("test_order_flow result: %s", res)
             return res
         except Exception as e:
@@ -845,7 +845,7 @@ if __name__ == "__main__":
     c = BinanceClient()
     try:
         print("Base URL:", c.base_url)
-        p = c.ticker_price("BTCUSDT")
-        print("BTCUSDT price:", p)
+        p = c.ticker_price("XRPUSDT")
+        print("XRPUSDT price:", p)
     except Exception as ex:
         print("Quick self-test failed:", ex)
